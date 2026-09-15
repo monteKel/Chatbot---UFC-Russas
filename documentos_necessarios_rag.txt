@@ -1,0 +1,40 @@
+Documentos necessários para o RAG do Chatbot - UFC Russas
+============================================================
+
+POR CURSO (necessário para os 5 cursos: Ciência da Computação,
+Engenharia de Software, Engenharia Civil, Engenharia Mecânica,
+Engenharia de Produção)
+
+Prioridade alta:
+1. Manual/Regulamento de Atividades Complementares
+2. PPC - Projeto Pedagógico do Curso (grade curricular, ementas, pré-requisitos)
+
+Prioridade média:
+3. Manual de Estágio Curricular Supervisionado
+4. Regulamento/Manual de TCC (ou "Projeto Final do Curso")
+5. Manual de Curricularização da Extensão
+6. Grade curricular / fluxograma (se for documento separado do PPC)
+
+Status atual (2026-09-15):
+- Ciência da Computação: Atividades Complementares confirmado (192h)
+- Engenharia de Software: Atividades Complementares confirmado (288h)
+- Engenharia Civil: falta (documento só existia no site antigo, que saiu do ar)
+- Engenharia Mecânica: falta (mesmo motivo)
+- Engenharia de Produção: falta (ainda não verificado)
+
+
+DOCUMENTOS GERAIS (servem para todos os cursos, só precisa de 1 de cada)
+
+7. Regimento Geral da UFC
+8. Resolução sobre trancamento de matrícula
+9. Resolução sobre abreviação de estudos
+10. Resolução sobre aproveitamento de estudos
+11. Resolução sobre outorga de grau
+12. Resolução sobre reprovação por frequência
+13. Lei do Estágio (Lei 11.788/2008) + Resolução do estágio curricular supervisionado
+14. Resolução sobre bolsas
+15. Guia do Estudante / Direitos e Deveres
+
+Observação: o Calendário Acadêmico também seria útil, mas muda a cada
+semestre - precisa reingerir/atualizar periodicamente, não é um
+documento estático como os outros.
