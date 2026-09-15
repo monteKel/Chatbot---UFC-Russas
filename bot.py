@@ -6,7 +6,6 @@ from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 from telegram.constants import ChatAction
-from telegram.error import BadRequest
 from google import genai
 from google.genai import types
 from google.genai.errors import APIError
@@ -50,7 +49,10 @@ COMMANDS_TEXT = (
 def get_chat(chat_id:int):
     if chat_id not in chats:
         chats[chat_id] = gemini_client.aio.chats.create(model=GEMINI_MODEL,
-        config=types.GenerateContentConfig(system_instruction=SYSTEM_INSTRUCTION),
+        config=types.GenerateContentConfig(
+            system_instruction=SYSTEM_INSTRUCTION,
+            tools=[types.Tool(google_search=types.GoogleSearch())],
+        ),
         )
     return chats[chat_id]
 async def generate_response(chat,user_text: str, tries: int = 3) -> str:
@@ -84,12 +86,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     except APIError as e:
         logger.error("Todas as tentativas falharam: %s", e)
         reply_text = "Desculpe, tive um problema para gerar a resposta agora. Tente novamente em instantes."
-
-    try:
-        await update.message.reply_text(reply_text, parse_mode="Markdown")
-    except BadRequest:
-        logger.warning("Falha ao formatar resposta com Markdown, reenviando como texto puro")
-        await update.message.reply_text(reply_text)
+    await update.message.reply_text(reply_text)
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "👋 *Olá! Eu sou o assistente virtual da UFC Russas.*\n\n"
