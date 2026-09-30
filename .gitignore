@@ -5,3 +5,4 @@ __pycache__/
 .claude
 *.key
 *.pem
+Documentos/**/ep_declaracao_*
