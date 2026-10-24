@@ -6,3 +6,6 @@ __pycache__/
 *.key
 *.pem
 Documentos/**/ep_declaracao_*
+*.db
+*.db-journal
+chroma_db/

@@ -10,6 +10,8 @@ from google import genai
 from google.genai import types
 from google.genai.errors import APIError
 
+import db
+
 #Load the .env file to load the tokens
 load_dotenv()
 #Config the logger
@@ -45,20 +47,69 @@ COMMANDS_TEXT = (
     "/reset - Reinicia a memória da nossa conversa"
 )
 
+VALID_COURSES = {
+    "Ciência da Computação",
+    "Engenharia de Software",
+    "Engenharia de Produção",
+    "Engenharia Civil",
+    "Engenharia Mecânica",
+}
+
+SET_COURSE_DECLARATION = types.FunctionDeclaration(
+    name="set_course",
+    description=(
+        "Registra ou corrige o curso de graduação do aluno quando ele mencionar, "
+        "direta ou indiretamente, qual curso faz."
+    ),
+    parameters=types.Schema(
+        type=types.Type.OBJECT,
+        properties={
+            "course": types.Schema(
+                type=types.Type.STRING,
+                enum=sorted(VALID_COURSES),
+                description="Nome completo do curso de graduação do aluno, na lista de cursos do Campus de Russas.",
+            )
+        },
+        required=["course"],
+    ),
+)
+
 #Functions
 def get_chat(chat_id:int):
     if chat_id not in chats:
+        history = [
+            types.Content(role=role, parts=[types.Part(text=content)])
+            for role, content in db.get_history(chat_id)
+        ]
         chats[chat_id] = gemini_client.aio.chats.create(model=GEMINI_MODEL,
         config=types.GenerateContentConfig(
             system_instruction=SYSTEM_INSTRUCTION,
-            tools=[types.Tool(google_search=types.GoogleSearch())],
+            tools=[
+                types.Tool(google_search=types.GoogleSearch()),
+                types.Tool(function_declarations=[SET_COURSE_DECLARATION]),
+            ],
         ),
+        history=history,
         )
     return chats[chat_id]
-async def generate_response(chat,user_text: str, tries: int = 3) -> str:
+async def generate_response(chat, chat_id: int, user_text: str, tries: int = 3) -> str:
     for exp in range(tries):
         try:
             response = await chat.send_message(user_text)
+            while response.function_calls:
+                function_responses = []
+                for call in response.function_calls:
+                    if call.name == "set_course":
+                        course = call.args.get("course")
+                        if course in VALID_COURSES:
+                            db.set_course(chat_id, course)
+                            result = {"status": "ok"}
+                        else:
+                            result = {"status": "error", "message": "curso invalido"}
+                    else:
+                        result = {"status": "error", "message": "funcao desconhecida"}
+                    function_responses.append(types.Part.from_function_response(name=call.name, response=result))
+                response = await chat.send_message(function_responses)
             return response.text
         except APIError as e:
             logger.warning("Tentativa %d falhou: %s", exp + 1, e)
@@ -75,6 +126,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if chat_id in awaiting_feedback:
         awaiting_feedback.discard(chat_id)
         logger.info("Feedback recebido de %s: %s", chat_id, user_text)
+        db.save_feedback(chat_id, user_text)
         await update.message.reply_text("Obrigado pelo feedback!")
         return
 
@@ -82,10 +134,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     try:
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-        reply_text = await generate_response(chat, user_text)
+        reply_text = await generate_response(chat, chat_id, user_text)
     except APIError as e:
         logger.error("Todas as tentativas falharam: %s", e)
         reply_text = "Desculpe, tive um problema para gerar a resposta agora. Tente novamente em instantes."
+    else:
+        db.save_message(chat_id, "user", user_text)
+        db.save_message(chat_id, "model", reply_text)
     await update.message.reply_text(reply_text)
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
@@ -100,6 +155,7 @@ async def handle_unsupported(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     chats.pop(chat_id, None)
+    db.clear_history(chat_id)
     await update.message.reply_text("Memória da conversa reiniciada.")
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
@@ -196,6 +252,7 @@ async def feedback_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 #Main
 def main() -> None:
+    db.init_db()
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start))
