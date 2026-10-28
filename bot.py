@@ -2,6 +2,7 @@
 import logging
 import os
 import asyncio
+import chromadb
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
@@ -25,6 +26,8 @@ logger = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN = os.environ['TELEGRAM_BOT_TOKEN']
 GEMINI_API_KEY = os.environ['GEMINI_API_KEY']
 GEMINI_MODEL = os.environ.get('GEMINI_MODEL', 'gemini-3.1-flash-lite')
+EMBEDDING_MODEL = os.environ.get('EMBEDDING_MODEL', 'gemini-embedding-001')
+CHROMA_PATH = os.environ.get('CHROMA_PATH', 'chroma_db')
 SYSTEM_INSTRUCTION = os.environ.get('PROMPT_GENAI')
 logger.info("Prompt carregado: %r", SYSTEM_INSTRUCTION)
 
@@ -32,6 +35,18 @@ logger.info("Prompt carregado: %r", SYSTEM_INSTRUCTION)
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 chats: dict[int,object] = {}
 awaiting_feedback: set[int] = set()
+
+#RAG setup
+chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
+rag_collection = chroma_client.get_or_create_collection("ufc_russas_docs")
+
+COURSE_TO_PREFIX = {
+    "Ciência da Computação": "cc",
+    "Engenharia de Software": "es",
+    "Engenharia de Produção": "ep",
+    "Engenharia Civil": "ec",
+    "Engenharia Mecânica": "em",
+}
 
 COMMANDS_TEXT = (
     "*Comandos disponíveis:*\n"
@@ -58,8 +73,13 @@ VALID_COURSES = {
 SET_COURSE_DECLARATION = types.FunctionDeclaration(
     name="set_course",
     description=(
-        "Registra ou corrige o curso de graduação do aluno quando ele mencionar, "
-        "direta ou indiretamente, qual curso faz."
+        "Registra ou corrige o curso de graduação do aluno. Só chame esta função quando "
+        "o aluno afirmar claramente e sem ambiguidade qual curso faz (ex: 'eu sou de "
+        "engenharia de software', 'meu curso é ciência da computação'), ou quando ele "
+        "pedir explicitamente para corrigir/trocar o curso já registrado. NÃO chame com "
+        "base em pistas indiretas, suposições ou menções a disciplinas/atividades que "
+        "poderiam pertencer a mais de um curso — nesses casos, pergunte ao aluno qual é "
+        "o curso antes de registrar."
     ),
     parameters=types.Schema(
         type=types.Type.OBJECT,
@@ -75,6 +95,26 @@ SET_COURSE_DECLARATION = types.FunctionDeclaration(
 )
 
 #Functions
+async def retrieve_context(question: str, course_prefix: str | None, n_results: int = 10) -> list[str]:
+    try:
+        embed_response = await gemini_client.aio.models.embed_content(
+            model=EMBEDDING_MODEL,
+            contents=[question],
+            config=types.EmbedContentConfig(task_type="RETRIEVAL_QUERY"),
+        )
+        query_embedding = embed_response.embeddings[0].values
+        results = rag_collection.query(
+            query_embeddings=[query_embedding],
+            n_results=n_results,
+            where={"course": course_prefix} if course_prefix else None,
+        )
+        documents = results.get("documents") or []
+        return documents[0] if documents else []
+    except APIError as e:
+        logger.warning("Falha ao buscar contexto no RAG: %s", e)
+        return []
+
+
 def get_chat(chat_id:int):
     if chat_id not in chats:
         history = [
@@ -131,10 +171,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     chat = get_chat(chat_id)
+    course = db.get_course(chat_id)
+    course_prefix = COURSE_TO_PREFIX.get(course) if course else None
+    retrieved_chunks = await retrieve_context(user_text, course_prefix)
+    if retrieved_chunks:
+        context_block = "\n\n---\n\n".join(retrieved_chunks)
+        prompt_text = (
+            f"Contexto de documentos oficiais da UFC Russas:\n{context_block}\n\n"
+            f"Pergunta do aluno: {user_text}"
+        )
+    else:
+        prompt_text = user_text
 
     try:
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-        reply_text = await generate_response(chat, chat_id, user_text)
+        reply_text = await generate_response(chat, chat_id, prompt_text)
     except APIError as e:
         logger.error("Todas as tentativas falharam: %s", e)
         reply_text = "Desculpe, tive um problema para gerar a resposta agora. Tente novamente em instantes."

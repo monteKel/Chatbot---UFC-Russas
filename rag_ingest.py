@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import time
 from pathlib import Path
 
@@ -36,6 +37,41 @@ CC_FILES = [
     "cc_fluxograma_integralizacao-curricular_2018.pdf",
     "cc_ppc_2022.pdf",
 ]
+
+ES_FILES = [
+    "es_atividades-complementares_regulamento_2019.pdf",
+    "es_ppc_2017.pdf",
+    "es_fluxograma_ppc-completo.pdf",
+    "es_estagio_manual-normatizacao_grade-2018_v2025.pdf",
+    "es_estagio_manual-normatizacao_grade-2025_v2025.pdf",
+    "es_estagio_fluxograma-matricula-etapas.pdf",
+    "es_tcc_regulamento_2024.1.pdf",
+    "es_tcc_fluxograma-tcc1-etapas.pdf",
+    "es_tcc_fluxograma-tcc1-matricula.pdf",
+    "es_tcc_fluxograma-tcc2-matricula-etapas.pdf",
+]
+
+EC_FILES = [
+    "ec_atividades-complementares_manual_2023.1.pdf",
+    "ec_estagio_manual-normatizacao_2023.1.pdf",
+    "ec_extensao_manual-curricularizacao_2026.pdf",
+    "ec_tcc_diretrizes-avaliacao-banca.pdf",
+    "ec_tcc_regulamento_2018.pdf",
+]
+
+EP_FILES = [
+    "ep_estagio_manual-normatizacao_2020.pdf",
+    "ep_fluxograma_integralizacao-curricular_2019.2.pdf",
+    "ep_ppc_2023.pdf",
+    "ep_tcc_regulamento_2020.pdf",
+]
+
+COURSE_FILES = {
+    "cc": CC_FILES,
+    "es": ES_FILES,
+    "ec": EC_FILES,
+    "ep": EP_FILES,
+}
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
@@ -125,4 +161,5 @@ def ingest_course(course: str, filenames: list[str]) -> None:
 
 
 if __name__ == "__main__":
-    ingest_course("cc", CC_FILES)
+    course = sys.argv[1] if len(sys.argv) > 1 else "cc"
+    ingest_course(course, COURSE_FILES[course])
