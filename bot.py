@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, ContextTypes, filters
 from telegram.constants import ChatAction
+from telegram.error import BadRequest
 from google import genai
 from google.genai import types
 from google.genai.errors import APIError
@@ -61,6 +62,7 @@ SYSTEM_INSTRUCTION = (
 TELEGRAM_MAX_LEN = 4000
 MAX_CERTIFICATE_BYTES = 10 * 1024 * 1024
 MAX_VOICE_SECONDS = 180
+CERTIFICATE_TIMEOUT = 300
 EMPTY_SOURCE_LINE = re.compile(r"\n+\W*fonte\W*:?\W*\(?\s*(nenhum|nenhuma|n/a|-)[^\n]*\s*$", re.IGNORECASE)
 ERROR_REPLY = "Desculpe, tive um problema para gerar a resposta agora. Tente novamente em instantes."
 logger.info("Prompt carregado: %r", SYSTEM_INSTRUCTION)
@@ -232,7 +234,7 @@ async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, user_
             if horas.supports(course) and horas.declares_activity(user_text):
                 activities = await horas.extract(user_text, course)
                 if activities:
-                    await send_hours_confirmation(update, course, activities, "texto", None)
+                    await send_hours_confirmation(update, course, activities, "texto", None, user_text)
                     return
             reply_text, provider = await generate_reply(chat_id, user_text, course)
     except TimeoutError:
@@ -249,7 +251,10 @@ async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, user_
         await update.message.reply_text(part)
 
 
-async def send_hours_confirmation(update: Update, course: str, activities: list, source: str, file_id: str | None) -> None:
+async def send_hours_confirmation(
+    update: Update, course: str, activities: list, source: str, file_id: str | None, history_label: str
+) -> None:
+    chat_id = update.effective_chat.id
     complete = [a for a in activities if a.credited_hours is not None]
     incomplete = [a for a in activities if a.credited_hours is None]
     sections = []
@@ -262,16 +267,18 @@ async def send_hours_confirmation(update: Update, course: str, activities: list,
             + "\n\nMe mande a informação que faltou (por exemplo: \"fiz monitoria por 16 semanas, 12h por semana\") "
             "que eu tento de novo."
         )
-    if not complete:
-        await update.message.reply_text("\n\n".join(sections))
-        return
-    sections.append("Posso salvar no seu registro de horas? (É uma estimativa: quem valida oficialmente é a coordenação.)")
-    token = horas.add_pending(update.effective_chat.id, complete, source, file_id)
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("Salvar", callback_data=f"hrs:ok:{token}"),
-        InlineKeyboardButton("Cancelar", callback_data=f"hrs:no:{token}"),
-    ]])
-    await update.message.reply_text("\n\n".join(sections), reply_markup=keyboard)
+    keyboard = None
+    if complete:
+        sections.append("Posso salvar no seu registro de horas? (É uma estimativa: quem valida oficialmente é a coordenação.)")
+        token = horas.add_pending(chat_id, complete, source, file_id)
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("Salvar", callback_data=f"hrs:ok:{token}"),
+            InlineKeyboardButton("Cancelar", callback_data=f"hrs:no:{token}"),
+        ]])
+    text = "\n\n".join(sections)
+    db.save_message(chat_id, "user", history_label)
+    db.save_message(chat_id, "model", text)
+    await update.message.reply_text(text, reply_markup=keyboard)
 
 
 async def handle_certificate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -300,6 +307,9 @@ async def handle_certificate(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await message.reply_text("Esse arquivo é grande demais (máximo 10 MB). Tente mandar uma versão menor.")
         return
 
+    name = getattr(attachment, "file_name", None) or "foto"
+    if horas.extraction_busy():
+        await message.reply_text(f"Recebi \"{name}\"! Tem outros certificados na fila, já já eu analiso este.")
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
     try:
         telegram_file = await attachment.get_file()
@@ -319,20 +329,23 @@ async def handle_certificate(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     activities = None
     try:
-        async with asyncio.timeout(50):
+        async with asyncio.timeout(CERTIFICATE_TIMEOUT):
             activities = await horas.extract(text, course)
     except TimeoutError:
         logger.error("Tempo esgotado extraindo certificado de %s", chat_id)
     if activities is None:
-        await message.reply_text(ERROR_REPLY)
+        await message.reply_text(f"Desculpe, não consegui analisar \"{name}\" agora. Pode mandar esse de novo daqui a pouco?")
         return
     if not activities:
         await message.reply_text(
-            "Não identifiquei nesse arquivo uma atividade complementar que se encaixe nas regras do seu curso. "
+            f"Não identifiquei em \"{name}\" uma atividade complementar que se encaixe nas regras do seu curso. "
             "Se achar que é um erro, me diga qual foi a atividade e a carga horária."
         )
         return
-    await send_hours_confirmation(update, course, activities, "pdf" if is_pdf else "imagem", attachment.file_id)
+    await send_hours_confirmation(
+        update, course, activities, "pdf" if is_pdf else "imagem", attachment.file_id,
+        f"[Enviei um certificado: {name}]",
+    )
 
 
 def hours_listing(chat_id: int) -> tuple[str, InlineKeyboardMarkup | None]:
@@ -374,7 +387,11 @@ async def submission_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def handle_hours_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
+    try:
+        await query.answer()
+    except BadRequest:
+        # Telegram expires a click after ~15s; the click itself is still valid, so keep going.
+        logger.info("Callback de %s respondido fora do prazo do Telegram", update.effective_chat.id)
     _, action, token = query.data.split(":", 2)
     chat_id = update.effective_chat.id
     if action == "del":
@@ -388,10 +405,15 @@ async def handle_hours_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_reply_markup(reply_markup=None)
         await query.message.reply_text("Esse registro expirou. Mande o certificado de novo.")
         return
+    names = ", ".join(a.name for a in pending.activities)
     if action != "ok":
+        db.save_message(chat_id, "user", "[Cliquei em Cancelar]")
+        db.save_message(chat_id, "model", f"Cancelado, não salvei: {names}.")
         await query.edit_message_text(f"{query.message.text}\n\nCancelado, nada foi salvo.")
         return
     horas.save(pending)
+    db.save_message(chat_id, "user", "[Cliquei em Salvar]")
+    db.save_message(chat_id, "model", f"Salvei no seu registro de horas: {names}.")
     await query.edit_message_text(f"{query.message.text}\n\nSalvo!")
     summary = horas.summary(chat_id, db.get_course(chat_id))
     if summary:
@@ -547,7 +569,10 @@ async def feedback_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 #Main
 def main() -> None:
     db.init_db()
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    # Concurrent updates so one student's slow request (e.g. a queued certificate) doesn't block
+    # everyone else or make button clicks expire. Everything still runs on one event loop thread,
+    # so the shared SQLite connection stays safe.
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).concurrent_updates(True).build()
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("reset", reset))

@@ -4,8 +4,9 @@ from datetime import datetime, timedelta, timezone
 
 DB_PATH = os.environ.get("DB_PATH", "bot.db")
 
-# A mesma conexão é reaproveitada pelo event loop único do bot (polling sequencial),
-# então check_same_thread=False evita o erro de afinidade de thread do sqlite3 sem precisar de lock.
+# A mesma conexão é usada só pela thread do event loop do bot (as atualizações concorrentes são
+# corrotinas na mesma thread e estas funções não têm await), então check_same_thread=False evita o
+# erro de afinidade de thread do sqlite3 sem precisar de lock.
 _conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 _conn.execute("PRAGMA foreign_keys = ON")
 

@@ -155,26 +155,35 @@ def _retry_after(error: APIStatusError, default: float) -> float:
         return default
 
 
-async def _create(provider: dict, messages: list[dict], tools: list[dict] | None = None):
+async def _create(provider: dict, messages: list[dict], tools: list[dict] | None = None, max_wait: float = SHORT_RETRY_MAX_WAIT):
     kwargs = dict(model=provider["model"], messages=messages, max_tokens=provider["max_tokens"], **provider["params"])
     if tools:
         kwargs.update(tools=tools, tool_choice="auto")
-    try:
-        return await provider["client"].chat.completions.create(**kwargs)
-    except RateLimitError as e:
-        # Per-minute token windows (e.g. Groq's 8K TPM) often free up in a couple of seconds.
-        wait = _retry_after(e, 999)
-        if wait > SHORT_RETRY_MAX_WAIT:
-            raise
-        await asyncio.sleep(wait)
-        return await provider["client"].chat.completions.create(**kwargs)
+    budget = max_wait
+    while True:
+        try:
+            return await provider["client"].chat.completions.create(**kwargs)
+        except RateLimitError as e:
+            # Per-minute token windows (e.g. Groq's 8K TPM) often free up in a few seconds.
+            wait = _retry_after(e, 999)
+            if wait > budget:
+                raise
+            budget -= wait
+            await asyncio.sleep(wait)
 
 
-async def _with_failover(operation: Callable[[dict], Awaitable], exclude: tuple[str, ...] = ()) -> tuple[object, str | None]:
+async def _with_failover(
+    operation: Callable[[dict], Awaitable], exclude: tuple[str, ...] = (), max_wait: float = 0
+) -> tuple[object, str | None]:
     for provider in get_providers():
         name = provider["name"]
-        if name in exclude or time.monotonic() < _cooldown_until.get(name, 0):
+        if name in exclude:
             continue
+        remaining = _cooldown_until.get(name, 0) - time.monotonic()
+        if remaining > 0:
+            if remaining > max_wait:
+                continue
+            await asyncio.sleep(remaining)
         try:
             return await operation(provider), name
         except RateLimitError as e:
@@ -194,11 +203,13 @@ async def _with_failover(operation: Callable[[dict], Awaitable], exclude: tuple[
     return None, None
 
 
-async def call_tool(messages: list[dict], tool: dict, exclude: tuple[str, ...] = ()) -> tuple[list[dict] | None, str | None]:
+async def call_tool(
+    messages: list[dict], tool: dict, exclude: tuple[str, ...] = (), max_wait: float = SHORT_RETRY_MAX_WAIT
+) -> tuple[list[dict] | None, str | None]:
     tool_name = tool["function"]["name"]
 
     async def operation(provider: dict) -> list[dict]:
-        response = await _create(provider, messages, tools=[tool])
+        response = await _create(provider, messages, tools=[tool], max_wait=max_wait)
         calls = []
         for call in response.choices[0].message.tool_calls or []:
             if call.function.name != tool_name:
@@ -211,7 +222,7 @@ async def call_tool(messages: list[dict], tool: dict, exclude: tuple[str, ...] =
                 calls.append(args)
         return calls
 
-    return await _with_failover(operation, exclude)
+    return await _with_failover(operation, exclude, max_wait)
 
 
 async def detect_course(user_text: str, current_course: str | None) -> str | None:

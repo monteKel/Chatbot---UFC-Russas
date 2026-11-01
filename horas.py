@@ -1,3 +1,4 @@
+import asyncio
 import io
 import logging
 import re
@@ -14,6 +15,9 @@ from regras_horas import COURSE_RULES, ROMAN
 logger = logging.getLogger(__name__)
 
 MAX_PDF_PAGES = 5
+# Certificates aren't time-critical, so wait out Groq's per-minute token window instead of
+# falling back to the much slower free providers.
+EXTRACTION_MAX_WAIT = 60
 MIN_READABLE_CHARS = 40
 MAX_TEXT_CHARS = 6000
 PENDING_TTL = 3600
@@ -91,6 +95,12 @@ class Pending:
 
 
 _pending: dict[str, Pending] = {}
+# One extraction at a time, so a batch of certificates doesn't burst through the token limit.
+_extraction_lock = asyncio.Lock()
+
+
+def extraction_busy() -> bool:
+    return _extraction_lock.locked()
 
 
 def supports(course: str | None) -> bool:
@@ -164,7 +174,8 @@ async def extract(text: str, course: str) -> list[Activity] | None:
         {"role": "system", "content": EXTRACTION_PROMPT.format(course=course, rules=rules["rules"])},
         {"role": "user", "content": _redact(text)[:MAX_TEXT_CHARS]},
     ]
-    calls, provider = await llm.call_tool(messages, REGISTER_TOOL, exclude=PRIVATE_EXCLUDE)
+    async with _extraction_lock:
+        calls, provider = await llm.call_tool(messages, REGISTER_TOOL, exclude=PRIVATE_EXCLUDE, max_wait=EXTRACTION_MAX_WAIT)
     if provider is None:
         return None
     activities = []
