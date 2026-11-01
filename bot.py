@@ -1,6 +1,7 @@
 #Imports
 import logging
 import os
+import re
 import asyncio
 import chromadb
 from dotenv import load_dotenv
@@ -35,7 +36,14 @@ CHROMA_PATH = os.environ.get('CHROMA_PATH', 'chroma_db')
 HISTORY_LIMIT = int(os.environ.get('HISTORY_LIMIT', 6))
 SYSTEM_INSTRUCTION = (
     os.environ.get('PROMPT_GENAI', '')
-    + "\n\nRegras adicionais: Responda sempre em português do Brasil, em texto simples, sem tabelas. "
+    + "\n\nO que este bot sabe fazer: o aluno pode mandar aqui no chat o certificado ou declaração em PDF ou foto, "
+    "ou contar uma atividade que já fez (ex.: \"fiz um curso de 40h\"), e o bot calcula as horas complementares pelo "
+    "regulamento do curso e pede confirmação antes de salvar no registro pessoal do aluno. O comando /horas mostra e "
+    "permite apagar as horas registradas; /comoentregar explica como entregar oficialmente na coordenação; /faq tem "
+    "as dúvidas mais comuns. Esse registro é só um acompanhamento pessoal: a validação oficial continua sendo da "
+    "coordenação. Quando o aluno quiser registrar horas ou mandar um certificado, diga que ele pode enviar o arquivo "
+    "aqui mesmo; nunca diga que o bot não recebe documentos."
+    "\n\nRegras adicionais: Responda sempre em português do Brasil, em texto simples, sem tabelas. "
     "Se o curso do aluno não estiver registrado e a resposta depender do curso, pergunte qual é o curso dele. "
     "Você não tem acesso à internet: use somente o contexto fornecido. Nunca invente exemplos, números, "
     "limites de horas ou regras que não estejam escritos no contexto; se o contexto não trouxer exemplos de uma "
@@ -53,6 +61,7 @@ SYSTEM_INSTRUCTION = (
 TELEGRAM_MAX_LEN = 4000
 MAX_CERTIFICATE_BYTES = 10 * 1024 * 1024
 MAX_VOICE_SECONDS = 180
+EMPTY_SOURCE_LINE = re.compile(r"\n+\W*fonte\W*:?\W*\(?\s*(nenhum|nenhuma|n/a|-)[^\n]*\s*$", re.IGNORECASE)
 ERROR_REPLY = "Desculpe, tive um problema para gerar a resposta agora. Tente novamente em instantes."
 logger.info("Prompt carregado: %r", SYSTEM_INSTRUCTION)
 logger.info("Provedores de geração: %s", [p["name"] for p in llm.get_providers()])
@@ -174,7 +183,10 @@ async def generate_reply(chat_id: int, user_text: str, course: str | None) -> tu
     course_prefix = COURSE_TO_PREFIX.get(search_course) if search_course else None
     retrieved_chunks = await retrieve_context(user_text, course_prefix)
     messages = build_messages(chat_id, user_text, retrieved_chunks, course)
-    return await llm.answer(messages)
+    reply_text, provider = await llm.answer(messages)
+    if reply_text:
+        reply_text = EMPTY_SOURCE_LINE.sub("", reply_text).rstrip()
+    return reply_text, provider
 
 
 #Application Handlers
