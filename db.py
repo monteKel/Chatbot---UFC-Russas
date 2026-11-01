@@ -64,6 +64,11 @@ def init_db() -> None:
         )
         """
     )
+    _ensure_column("complementary_hours", "activity_item", "TEXT")
+    _ensure_column("complementary_hours", "certificate_hours", "REAL")
+    _ensure_column("complementary_hours", "source", "TEXT")
+    _ensure_column("complementary_hours", "file_id", "TEXT")
+    _ensure_column("complementary_hours", "explanation", "TEXT")
     _conn.commit()
 
 
@@ -125,6 +130,53 @@ def save_feedback(chat_id: int, content: str) -> None:
         (chat_id, content, datetime.now(timezone.utc).isoformat()),
     )
     _conn.commit()
+
+
+def add_complementary_hours(
+    chat_id: int,
+    group: int,
+    item: str | None,
+    name: str,
+    certificate_hours: float | None,
+    credited_hours: float,
+    source: str,
+    file_id: str | None,
+    explanation: str,
+) -> None:
+    _ensure_user(chat_id)
+    _conn.execute(
+        """
+        INSERT INTO complementary_hours
+            (chat_id, activity_group, activity_item, activity_name, certificate_hours, hours,
+             status, source, file_id, explanation, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'registrado pelo aluno', ?, ?, ?, ?)
+        """,
+        (chat_id, group, item, name, certificate_hours, credited_hours, source, file_id, explanation,
+         datetime.now(timezone.utc).isoformat()),
+    )
+    _touch_activity(chat_id)
+    _conn.commit()
+
+
+def list_complementary_hours(chat_id: int) -> list[tuple[int, int, str, float]]:
+    return _conn.execute(
+        "SELECT id, activity_group, activity_name, hours FROM complementary_hours WHERE chat_id = ? ORDER BY id",
+        (chat_id,),
+    ).fetchall()
+
+
+def delete_complementary_hours(chat_id: int, entry_id: int) -> bool:
+    cursor = _conn.execute("DELETE FROM complementary_hours WHERE id = ? AND chat_id = ?", (entry_id, chat_id))
+    _conn.commit()
+    return cursor.rowcount > 0
+
+
+def hours_by_group(chat_id: int) -> dict[int, float]:
+    rows = _conn.execute(
+        "SELECT activity_group, SUM(hours) FROM complementary_hours WHERE chat_id = ? GROUP BY activity_group",
+        (chat_id,),
+    ).fetchall()
+    return {group: total for group, total in rows}
 
 
 def delete_inactive_users(days: int) -> int:

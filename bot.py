@@ -4,14 +4,16 @@ import os
 import asyncio
 import chromadb
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, ContextTypes, filters
 from telegram.constants import ChatAction
 from google import genai
 from google.genai import types
 from google.genai.errors import APIError
 
 import db
+import horas
+import llm
 
 #Load the .env file to load the tokens
 load_dotenv()
@@ -25,15 +27,30 @@ logger = logging.getLogger(__name__)
 #Keys
 TELEGRAM_BOT_TOKEN = os.environ['TELEGRAM_BOT_TOKEN']
 GEMINI_API_KEY = os.environ['GEMINI_API_KEY']
-GEMINI_MODEL = os.environ.get('GEMINI_MODEL', 'gemini-3.1-flash-lite')
 EMBEDDING_MODEL = os.environ.get('EMBEDDING_MODEL', 'gemini-embedding-001')
 CHROMA_PATH = os.environ.get('CHROMA_PATH', 'chroma_db')
-SYSTEM_INSTRUCTION = os.environ.get('PROMPT_GENAI')
+HISTORY_LIMIT = int(os.environ.get('HISTORY_LIMIT', 6))
+SYSTEM_INSTRUCTION = (
+    os.environ.get('PROMPT_GENAI', '')
+    + "\n\nRegras adicionais: Responda sempre em português do Brasil, em texto simples, sem tabelas. "
+    "Se o curso do aluno não estiver registrado e a resposta depender do curso, pergunte qual é o curso dele. "
+    "Você não tem acesso à internet: use somente o contexto fornecido. Nunca invente exemplos, números, "
+    "limites de horas ou regras que não estejam escritos no contexto; se o contexto não trouxer exemplos de uma "
+    "categoria, diga que o documento não lista exemplos para ela. Atividades complementares, extensão "
+    "(curricularização da extensão), estágio e TCC são componentes diferentes, com cargas horárias diferentes: "
+    "nunca use a carga horária de um como se fosse de outro. Se a informação não estiver no contexto, "
+    "diga que não encontrou nos documentos oficiais e oriente o aluno a procurar a coordenação do curso. "
+    "Comandos de contato das coordenações: /coordcc (Ciência da Computação), /coordes (Engenharia de Software), "
+    "/coordep (Engenharia de Produção), /coordec (Engenharia Civil), /coordem (Engenharia Mecânica)."
+)
+TELEGRAM_MAX_LEN = 4000
+MAX_CERTIFICATE_BYTES = 10 * 1024 * 1024
+ERROR_REPLY = "Desculpe, tive um problema para gerar a resposta agora. Tente novamente em instantes."
 logger.info("Prompt carregado: %r", SYSTEM_INSTRUCTION)
+logger.info("Provedores de geração: %s", [p["name"] for p in llm.get_providers()])
 
-#Gemini setup/deep-config
+#Gemini (embeddings only)
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-chats: dict[int,object] = {}
 awaiting_feedback: set[int] = set()
 
 #RAG setup
@@ -54,6 +71,7 @@ COMMANDS_TEXT = (
     "/help - Mostra a lista de comandos\n"
     "/faq - Perguntas frequentes\n"
     "/feedback - Envia um feedback anônimo\n"
+    "/horas - Mostra (e permite apagar) suas horas complementares registradas\n"
     "/coordcc - Contato da coordenação de Ciência da Computação\n"
     "/coordes - Contato da coordenação de Engenharia de Software\n"
     "/coordep - Contato da coordenação de Engenharia de Produção\n"
@@ -62,40 +80,8 @@ COMMANDS_TEXT = (
     "/reset - Reinicia a memória da nossa conversa"
 )
 
-VALID_COURSES = {
-    "Ciência da Computação",
-    "Engenharia de Software",
-    "Engenharia de Produção",
-    "Engenharia Civil",
-    "Engenharia Mecânica",
-}
-
-SET_COURSE_DECLARATION = types.FunctionDeclaration(
-    name="set_course",
-    description=(
-        "Registra ou corrige o curso de graduação do aluno. Só chame esta função quando "
-        "o aluno afirmar claramente e sem ambiguidade qual curso faz (ex: 'eu sou de "
-        "engenharia de software', 'meu curso é ciência da computação'), ou quando ele "
-        "pedir explicitamente para corrigir/trocar o curso já registrado. NÃO chame com "
-        "base em pistas indiretas, suposições ou menções a disciplinas/atividades que "
-        "poderiam pertencer a mais de um curso — nesses casos, pergunte ao aluno qual é "
-        "o curso antes de registrar."
-    ),
-    parameters=types.Schema(
-        type=types.Type.OBJECT,
-        properties={
-            "course": types.Schema(
-                type=types.Type.STRING,
-                enum=sorted(VALID_COURSES),
-                description="Nome completo do curso de graduação do aluno, na lista de cursos do Campus de Russas.",
-            )
-        },
-        required=["course"],
-    ),
-)
-
 #Functions
-async def retrieve_context(question: str, course_prefix: str | None, n_results: int = 10) -> list[str]:
+async def retrieve_context(question: str, course_prefix: str | None, n_results: int = 10) -> list[str] | None:
     try:
         embed_response = await gemini_client.aio.models.embed_content(
             model=EMBEDDING_MODEL,
@@ -112,50 +98,66 @@ async def retrieve_context(question: str, course_prefix: str | None, n_results: 
         return documents[0] if documents else []
     except APIError as e:
         logger.warning("Falha ao buscar contexto no RAG: %s", e)
-        return []
+        return None
 
 
-def get_chat(chat_id:int):
-    if chat_id not in chats:
-        history = [
-            types.Content(role=role, parts=[types.Part(text=content)])
-            for role, content in db.get_history(chat_id)
-        ]
-        chats[chat_id] = gemini_client.aio.chats.create(model=GEMINI_MODEL,
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_INSTRUCTION,
-            tools=[
-                types.Tool(google_search=types.GoogleSearch()),
-                types.Tool(function_declarations=[SET_COURSE_DECLARATION]),
-            ],
-        ),
-        history=history,
+def split_message(text: str, limit: int = TELEGRAM_MAX_LEN) -> list[str]:
+    parts = []
+    while len(text) > limit:
+        cut = text.rfind("\n", 0, limit)
+        if cut <= 0:
+            cut = limit
+        parts.append(text[:cut])
+        text = text[cut:].lstrip("\n")
+    if text:
+        parts.append(text)
+    return parts
+
+
+def build_messages(chat_id: int, user_text: str, chunks: list[str] | None, course: str | None) -> list[dict]:
+    system = SYSTEM_INSTRUCTION
+    if course:
+        system += f"\n\nCurso registrado do aluno: {course}."
+    hours_summary = horas.summary(chat_id, course)
+    if hours_summary:
+        system += (
+            "\n\nHoras complementares que o próprio aluno registrou no bot (estimativa, ainda não validada "
+            f"pela coordenação; os tetos de cada grupo já foram aplicados):\n{hours_summary}"
         )
-    return chats[chat_id]
-async def generate_response(chat, chat_id: int, user_text: str, tries: int = 3) -> str:
-    for exp in range(tries):
-        try:
-            response = await chat.send_message(user_text)
-            while response.function_calls:
-                function_responses = []
-                for call in response.function_calls:
-                    if call.name == "set_course":
-                        course = call.args.get("course")
-                        if course in VALID_COURSES:
-                            db.set_course(chat_id, course)
-                            result = {"status": "ok"}
-                        else:
-                            result = {"status": "error", "message": "curso invalido"}
-                    else:
-                        result = {"status": "error", "message": "funcao desconhecida"}
-                    function_responses.append(types.Part.from_function_response(name=call.name, response=result))
-                response = await chat.send_message(function_responses)
-            return response.text
-        except APIError as e:
-            logger.warning("Tentativa %d falhou: %s", exp + 1, e)
-            if exp == tries - 1:
-                raise
-            await asyncio.sleep(2 ** exp)
+    messages = [{"role": "system", "content": system}]
+    for role, content in db.get_history(chat_id, limit=HISTORY_LIMIT):
+        messages.append({"role": "assistant" if role == "model" else "user", "content": content})
+
+    if chunks is None:
+        context_block = "(Não foi possível consultar os documentos oficiais agora. Não invente informações.)"
+    elif not chunks:
+        context_block = "(Nenhum trecho relevante encontrado nos documentos oficiais.)"
+    else:
+        context_block = "\n\n---\n\n".join(chunks)
+    messages.append({
+        "role": "user",
+        "content": f"Contexto de documentos oficiais da UFC Russas:\n{context_block}\n\nPergunta do aluno: {user_text}",
+    })
+    return messages
+
+
+async def resolve_course(chat_id: int, user_text: str) -> str | None:
+    course = db.get_course(chat_id)
+    if llm.mentions_course(user_text):
+        detected = await llm.detect_course(user_text, course)
+        if detected and detected != course:
+            db.set_course(chat_id, detected)
+            logger.info("Curso de %s registrado: %s", chat_id, detected)
+            course = detected
+    return course
+
+
+async def generate_reply(chat_id: int, user_text: str, course: str | None) -> tuple[str | None, str | None]:
+    search_course = llm.course_named_in(user_text) or course
+    course_prefix = COURSE_TO_PREFIX.get(search_course) if search_course else None
+    retrieved_chunks = await retrieve_context(user_text, course_prefix)
+    messages = build_messages(chat_id, user_text, retrieved_chunks, course)
+    return await llm.answer(messages)
 
 
 #Application Handlers
@@ -170,48 +172,190 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("Obrigado pelo feedback!")
         return
 
-    chat = get_chat(chat_id)
-    course = db.get_course(chat_id)
-    course_prefix = COURSE_TO_PREFIX.get(course) if course else None
-    retrieved_chunks = await retrieve_context(user_text, course_prefix)
-    if retrieved_chunks:
-        context_block = "\n\n---\n\n".join(retrieved_chunks)
-        prompt_text = (
-            f"Contexto de documentos oficiais da UFC Russas:\n{context_block}\n\n"
-            f"Pergunta do aluno: {user_text}"
-        )
-    else:
-        prompt_text = user_text
-
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    reply_text, provider = None, None
     try:
-        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-        reply_text = await generate_response(chat, chat_id, prompt_text)
-    except APIError as e:
-        logger.error("Todas as tentativas falharam: %s", e)
-        reply_text = "Desculpe, tive um problema para gerar a resposta agora. Tente novamente em instantes."
+        async with asyncio.timeout(50):
+            course = await resolve_course(chat_id, user_text)
+            if horas.supports(course) and horas.declares_activity(user_text):
+                activities = await horas.extract(user_text, course)
+                if activities:
+                    await send_hours_confirmation(update, course, activities, "texto", None)
+                    return
+            reply_text, provider = await generate_reply(chat_id, user_text, course)
+    except TimeoutError:
+        logger.error("Tempo esgotado gerando resposta para %s", chat_id)
+
+    if reply_text is None:
+        logger.error("Todos os provedores falharam para %s", chat_id)
+        reply_text = ERROR_REPLY
     else:
+        logger.info("Resposta para %s gerada por %s", chat_id, provider)
         db.save_message(chat_id, "user", user_text)
         db.save_message(chat_id, "model", reply_text)
-    await update.message.reply_text(reply_text)
+    for part in split_message(reply_text):
+        await update.message.reply_text(part)
+
+
+async def send_hours_confirmation(update: Update, course: str, activities: list, source: str, file_id: str | None) -> None:
+    complete = [a for a in activities if a.credited_hours is not None]
+    incomplete = [a for a in activities if a.credited_hours is None]
+    sections = []
+    if complete:
+        sections.append("Encontrei isto:\n\n" + "\n\n".join(horas.describe(a, course) for a in complete))
+    if incomplete:
+        sections.append(
+            "Não consegui calcular as horas destas atividades:\n\n"
+            + "\n\n".join(horas.describe(a, course) for a in incomplete)
+            + "\n\nMe mande a informação que faltou (por exemplo: \"fiz monitoria por 16 semanas, 12h por semana\") "
+            "que eu tento de novo."
+        )
+    if not complete:
+        await update.message.reply_text("\n\n".join(sections))
+        return
+    sections.append("Posso salvar no seu registro de horas? (É uma estimativa: quem valida oficialmente é a coordenação.)")
+    token = horas.add_pending(update.effective_chat.id, complete, source, file_id)
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("Salvar", callback_data=f"hrs:ok:{token}"),
+        InlineKeyboardButton("Cancelar", callback_data=f"hrs:no:{token}"),
+    ]])
+    await update.message.reply_text("\n\n".join(sections), reply_markup=keyboard)
+
+
+async def handle_certificate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    chat_id = update.effective_chat.id
+    course = db.get_course(chat_id)
+    if not course:
+        await message.reply_text(
+            "Antes de registrar horas, me diga qual é o seu curso (por exemplo: \"sou de Engenharia Civil\") "
+            "e depois mande o certificado de novo."
+        )
+        return
+    if not horas.supports(course):
+        await message.reply_text(
+            f"Ainda não tenho o regulamento de atividades complementares de {course}, então não consigo "
+            "calcular as horas. Procure a coordenação do seu curso."
+        )
+        return
+
+    if message.photo:
+        attachment, is_pdf = message.photo[-1], False
+    else:
+        attachment = message.document
+        is_pdf = attachment.mime_type == "application/pdf"
+    if attachment.file_size and attachment.file_size > MAX_CERTIFICATE_BYTES:
+        await message.reply_text("Esse arquivo é grande demais (máximo 10 MB). Tente mandar uma versão menor.")
+        return
+
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    try:
+        telegram_file = await attachment.get_file()
+        data = bytes(await telegram_file.download_as_bytearray())
+        text = await asyncio.to_thread(horas.read_pdf if is_pdf else horas.read_image, data)
+    except Exception:
+        logger.exception("Falha ao ler certificado de %s", chat_id)
+        await message.reply_text("Não consegui abrir esse arquivo. Tente mandar de novo, de preferência em PDF.")
+        return
+    if message.caption:
+        text = f"{text}\n\nMensagem do aluno: {message.caption}"
+    if not horas.is_readable(text):
+        await message.reply_text(
+            "Não consegui ler o texto desse arquivo. Tente uma foto mais nítida e reta, ou mande o PDF do certificado."
+        )
+        return
+
+    activities = None
+    try:
+        async with asyncio.timeout(50):
+            activities = await horas.extract(text, course)
+    except TimeoutError:
+        logger.error("Tempo esgotado extraindo certificado de %s", chat_id)
+    if activities is None:
+        await message.reply_text(ERROR_REPLY)
+        return
+    if not activities:
+        await message.reply_text(
+            "Não identifiquei nesse arquivo uma atividade complementar que se encaixe nas regras do seu curso. "
+            "Se achar que é um erro, me diga qual foi a atividade e a carga horária."
+        )
+        return
+    await send_hours_confirmation(update, course, activities, "pdf" if is_pdf else "imagem", attachment.file_id)
+
+
+def hours_listing(chat_id: int) -> tuple[str, InlineKeyboardMarkup | None]:
+    course = db.get_course(chat_id)
+    entries = db.list_complementary_hours(chat_id)
+    if not entries:
+        return "Você ainda não registrou nenhuma atividade. Mande um certificado em PDF ou foto, ou me conte uma atividade que você fez.", None
+    lines = ["Atividades registradas:"]
+    buttons = []
+    for number, (entry_id, group, name, hours) in enumerate(entries, start=1):
+        lines.append(f"{number}. {name} (Grupo {horas.ROMAN.get(group, group)}): {horas.fmt(hours)}h")
+        buttons.append([InlineKeyboardButton(f"Apagar {number}. {name[:30]}", callback_data=f"hrs:del:{entry_id}")])
+    summary = horas.summary(chat_id, course)
+    if summary:
+        lines.append(f"\nTotal por grupo (estimativa; a validação oficial é da coordenação):\n{summary}")
+    return "\n".join(lines), InlineKeyboardMarkup(buttons)
+
+
+async def hours_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text, keyboard = hours_listing(update.effective_chat.id)
+    await update.message.reply_text(text, reply_markup=keyboard)
+
+
+async def handle_hours_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    _, action, token = query.data.split(":", 2)
+    chat_id = update.effective_chat.id
+    if action == "del":
+        if token.isdigit():
+            db.delete_complementary_hours(chat_id, int(token))
+        text, keyboard = hours_listing(chat_id)
+        await query.edit_message_text(text, reply_markup=keyboard)
+        return
+    pending = horas.pop_pending(token, chat_id)
+    if pending is None:
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text("Esse registro expirou. Mande o certificado de novo.")
+        return
+    if action != "ok":
+        await query.edit_message_text(f"{query.message.text}\n\nCancelado, nada foi salvo.")
+        return
+    horas.save(pending)
+    await query.edit_message_text(f"{query.message.text}\n\nSalvo!")
+    summary = horas.summary(chat_id, db.get_course(chat_id))
+    if summary:
+        await query.message.reply_text(
+            f"Suas horas registradas até agora (estimativa; a validação oficial é da coordenação):\n\n{summary}"
+        )
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "👋 *Olá! Eu sou o assistente virtual da UFC Russas.*\n\n"
         "Posso te ajudar com dúvidas acadêmicas, especialmente sobre horas complementares.\n\n"
+        "Também posso registrar suas horas complementares: me mande o certificado em PDF ou foto "
+        "(ou me conte a atividade que você fez) e eu calculo as horas pelo regulamento do seu curso.\n\n"
         f"{COMMANDS_TEXT}\n\n"
         "Fora isso, é só me mandar sua pergunta diretamente!"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 async def handle_unsupported(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("Desculpe, por enquanto só consigo entender mensagens de texto, futuramente serei capaz de receber outros tipos de arquivos como certificados em pdf ou imagens :)")
+    await update.message.reply_text(
+        "Desculpe, só consigo entender mensagens de texto e certificados em PDF ou foto."
+    )
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
-    chats.pop(chat_id, None)
     db.clear_history(chat_id)
     await update.message.reply_text("Memória da conversa reiniciada.")
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "*Assistente Virtual - UFC Russas*\n\n"
         "Posso te ajudar com dúvidas acadêmicas, especialmente sobre horas complementares.\n\n"
+        "Para registrar horas, mande o certificado em PDF ou foto, ou me conte a atividade que você fez. "
+        "Para consultar, é só perguntar \"quantas horas eu já tenho?\".\n\n"
         f"{COMMANDS_TEXT}\n\n"
         "Fora isso, é só me mandar sua pergunta diretamente."
     )
@@ -311,12 +455,15 @@ def main() -> None:
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("faq", faq))
     application.add_handler(CommandHandler("feedback", feedback_command))
+    application.add_handler(CommandHandler("horas", hours_command))
     application.add_handler(CommandHandler("coordcc", coordcc))
     application.add_handler(CommandHandler("coordes", coordes))
     application.add_handler(CommandHandler("coordep", coordep))
     application.add_handler(CommandHandler("coordem", coordem))
     application.add_handler(CommandHandler("coordec", coordec))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(MessageHandler(filters.PHOTO | filters.Document.PDF | filters.Document.IMAGE, handle_certificate))
+    application.add_handler(CallbackQueryHandler(handle_hours_callback, pattern=r"^hrs:"))
     application.add_handler(MessageHandler(filters.ALL & ~filters.TEXT, handle_unsupported))
 
 
