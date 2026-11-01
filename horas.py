@@ -220,6 +220,22 @@ def save(pending: Pending) -> None:
         )
 
 
+def suggestions(chat_id: int, course: str | None) -> str | None:
+    if not supports(course):
+        return None
+    rules = COURSE_RULES[course]
+    by_group = db.hours_by_group(chat_id)
+    total = sum(min(by_group.get(group, 0.0), cap) for group, (_, cap) in rules["groups"].items())
+    if total >= rules["total"]:
+        return None
+    lines = ["Onde ainda dá para ganhar horas:"]
+    for group, (name, cap) in rules["groups"].items():
+        room = cap - min(by_group.get(group, 0.0), cap)
+        if room > 0:
+            lines.append(f"Grupo {ROMAN[group]} - {name} (cabem mais {fmt(room)}h): {rules['hints'][group]}")
+    return "\n".join(lines)
+
+
 def summary(chat_id: int, course: str | None) -> str | None:
     if not supports(course):
         return None

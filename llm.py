@@ -241,3 +241,19 @@ async def answer(messages: list[dict]) -> tuple[str | None, str | None]:
         return choice.message.content
 
     return await _with_failover(operation)
+
+
+async def transcribe(audio: bytes, filename: str) -> str | None:
+    groq = next((p for p in get_providers() if p["name"] == "groq"), None)
+    if groq is None:
+        return None
+    try:
+        result = await groq["client"].audio.transcriptions.create(
+            model=os.environ.get("GROQ_WHISPER_MODEL", "whisper-large-v3-turbo"),
+            file=(filename, audio),
+            language="pt",
+        )
+    except Exception:
+        logger.exception("groq: falha na transcrição de áudio")
+        return None
+    return (result.text or "").strip() or None

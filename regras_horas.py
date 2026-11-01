@@ -194,11 +194,109 @@ _ENG_GROUPS = {
 
 _EP_GROUPS = {**_ENG_GROUPS, 1: ("Iniciação à pesquisa ou ensino", 12), 7: ("Outras atividades (Revisão do Ensino Médio)", 48)}
 
+_CC_ES_HINTS = {
+    1: "iniciação científica, PET, monitoria, projeto de extensão com bolsa ou voluntário (até 3h por semana); cursos ministrados",
+    2: "grupos de teatro, dança, coral, música ou esporte (1h a cada 2h de treino; até 4h por apresentação/torneio)",
+    3: "congressos (4h por dia nacional, 8h internacional), palestras, defesas de TCC, maratona de programação, organizar eventos",
+    4: "estágio não curricular (até 8h por semana), empresa júnior, cursos e minicursos da área (1h por hora), visitas técnicas",
+    5: "artigos e resumos publicados com professor do Campus, registro de software ou patente",
+    6: "diretoria de empresa júnior ou centro acadêmico, representação estudantil em colegiado ou comissão",
+    7: "voluntariado e curso de língua estrangeira (1h a cada 2h), grupos de estudo e células do PACCE (1h a cada 3h)",
+}
+
+_EC_HINTS = {
+    1: "iniciação científica, PET, monitoria, extensão com bolsa ou voluntário (1h por semana a cada 4h semanais); cursos ministrados",
+    2: "grupos de teatro, dança, coral, música ou equipe esportiva (2h por evento)",
+    3: "congressos (4h por dia nacional, 6h internacional), palestras, defesas de projeto final, organizar eventos",
+    4: "estágio não curricular (até 8h por semana), cursos e minicursos da área (1h por hora), visitas técnicas",
+    5: "artigos e resumos publicados, registro de software ou patente",
+    6: "empresa júnior, centro acadêmico, representação estudantil",
+    7: "Revisão de Matemática e de Física do Ensino Médio (obrigatórias, 24h cada)",
+}
+
+_EP_HINTS = {
+    1: "iniciação científica, PET, monitoria (até 3h por semana), grupos de estudo e curso de língua estrangeira (1h a cada 2h)",
+    2: "grupos de teatro, dança, coral, música ou equipe esportiva (4h por evento)",
+    3: "congressos (4h por dia nacional, 8h internacional), palestras, defesas de TCC, organizar eventos",
+    4: "estágio não curricular, cursos e minicursos da área (1h por hora), visitas técnicas, PACCE, voluntariado",
+    5: "artigos e resumos publicados, registro de software ou patente",
+    6: "empresa júnior, centro acadêmico, representação estudantil",
+    7: "Revisão de Matemática e de Física do Ensino Médio (obrigatórias, 24h cada)",
+}
+
+_CC_ES_SUBMISSION = """\
+Como entregar suas horas complementares ({course}), segundo o regulamento do curso:
+
+1. Junte os comprovantes. Só valem atividades feitas depois do seu ingresso no curso, e o comprovante precisa mostrar a atividade, a carga horária (ou horas semanais) e o período.
+- Bolsas, monitoria, iniciação científica, PET e extensão: declaração do coordenador do projeto com horas semanais e período.
+- Eventos e palestras: certificado ou declaração da comissão organizadora.
+- Cursos e minicursos: certificado com carga horária e período.
+- Estágio não curricular: contrato de estágio.
+- Publicações: cópia da publicação ou carta de aceite.
+
+2. Preencha o Anexo III (Integralização de Atividades Complementares), que está no regulamento no site do curso: grupo (I a VII) e item, nome da atividade e horas. O comando /horas mostra o que você já registrou aqui.
+
+3. Separe os comprovantes em um envelope por grupo e coloque todos os envelopes dentro de uma pasta.
+
+4. Junte uma cópia do seu histórico e dos termos de estágio, se você fez ou está fazendo Estágio Supervisionado.
+
+5. Entregue na secretaria do curso dentro do prazo que a coordenação divulga a cada semestre. Comprovantes fora desse padrão não são analisados.
+
+6. Depois, confira no SIGAA as horas lançadas. Tudo precisa estar integralizado até 60 dias antes da conclusão do curso.
+
+Dúvidas: {contact}"""
+
+_EC_SUBMISSION = """\
+Como entregar suas horas complementares (Engenharia Civil), segundo o manual do curso:
+
+1. Junte os comprovantes. Só valem atividades feitas depois do seu ingresso no curso.
+- Iniciação científica, monitoria, PET e extensão: declaração do professor coordenador do projeto com horas semanais e período.
+- Eventos: certificado ou declaração da comissão organizadora (defesas de projeto final: declaração da coordenação).
+- Estágio não curricular: histórico e contrato de estágio. Cursos e minicursos: certificado de participação. Visitas técnicas: declaração do professor responsável.
+- Publicações: cópia da publicação.
+- Revisões de Matemática e Física: declaração da coordenação do curso.
+
+2. Dê entrada na secretaria do curso com todos os documentos exigidos. Em Engenharia Civil o protocolo pode ser feito ao longo do curso, não só no fim.
+
+3. Guarde o comprovante de entrega.
+
+4. Confira no SIGAA as horas lançadas. Tudo precisa estar integralizado até 60 dias antes da conclusão do curso.
+
+Dúvidas: /coordec"""
+
+_EP_SUBMISSION = """\
+Como entregar suas horas complementares (Engenharia de Produção), segundo o regulamento do curso:
+
+1. Junte os comprovantes. Só valem atividades feitas depois do seu ingresso no curso. Atividades de extensão não contam aqui, porque já entram na Unidade Curricular Especial de Extensão (UCEE).
+- Iniciação à pesquisa ou docência: declaração do professor coordenador do projeto com horas semanais e período.
+- Eventos: certificado ou declaração da comissão organizadora (defesas de TCC e seminários de estágio: declaração da coordenação).
+- Estágio não curricular: histórico e contrato de estágio. Cursos e minicursos: certificado de participação. Visitas técnicas: declaração do professor responsável.
+- Publicações: cópia da publicação.
+- Revisões de Matemática e Física: declaração do professor responsável, disponibilizada pela secretaria no site do curso.
+
+2. Dê entrada na secretaria do curso com todos os documentos exigidos. O regulamento também prevê o módulo de Creditação de Atividades Complementares e Extensão do SIGAA para cadastrar e acompanhar as horas; confirme com a coordenação qual meio está valendo no seu semestre.
+
+3. Guarde o comprovante de entrega.
+
+4. Confira no SIGAA as horas lançadas. Tudo precisa estar integralizado até 60 dias antes da conclusão do curso.
+
+Dúvidas: /coordep"""
+
 COURSE_RULES = {
-    "Ciência da Computação": {"total": 192, "groups": _CC_ES_GROUPS, "rules": _CC_ES_RULES},
-    "Engenharia de Software": {"total": 288, "groups": _CC_ES_GROUPS, "rules": _CC_ES_RULES},
-    "Engenharia Civil": {"total": 60, "groups": _ENG_GROUPS, "rules": _EC_RULES},
-    "Engenharia de Produção": {"total": 60, "groups": _EP_GROUPS, "rules": _EP_RULES},
+    "Ciência da Computação": {
+        "total": 192, "groups": _CC_ES_GROUPS, "rules": _CC_ES_RULES, "hints": _CC_ES_HINTS,
+        "submission": _CC_ES_SUBMISSION.format(course="Ciência da Computação", contact="/coordcc"),
+    },
+    "Engenharia de Software": {
+        "total": 288, "groups": _CC_ES_GROUPS, "rules": _CC_ES_RULES, "hints": _CC_ES_HINTS,
+        "submission": _CC_ES_SUBMISSION.format(course="Engenharia de Software", contact="/coordes"),
+    },
+    "Engenharia Civil": {
+        "total": 60, "groups": _ENG_GROUPS, "rules": _EC_RULES, "hints": _EC_HINTS, "submission": _EC_SUBMISSION,
+    },
+    "Engenharia de Produção": {
+        "total": 60, "groups": _EP_GROUPS, "rules": _EP_RULES, "hints": _EP_HINTS, "submission": _EP_SUBMISSION,
+    },
 }
 
 ROMAN = {1: "I", 2: "II", 3: "III", 4: "IV", 5: "V", 6: "VI", 7: "VII"}

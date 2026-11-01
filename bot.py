@@ -12,6 +12,7 @@ from google.genai import types
 from google.genai.errors import APIError
 
 import db
+import fontes
 import horas
 import llm
 
@@ -23,6 +24,8 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+# httpx logs every request URL at INFO, and Telegram URLs embed the bot token.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 #Keys
 TELEGRAM_BOT_TOKEN = os.environ['TELEGRAM_BOT_TOKEN']
@@ -41,10 +44,15 @@ SYSTEM_INSTRUCTION = (
     "nunca use a carga horária de um como se fosse de outro. Se a informação não estiver no contexto, "
     "diga que não encontrou nos documentos oficiais e oriente o aluno a procurar a coordenação do curso. "
     "Comandos de contato das coordenações: /coordcc (Ciência da Computação), /coordes (Engenharia de Software), "
-    "/coordep (Engenharia de Produção), /coordec (Engenharia Civil), /coordem (Engenharia Mecânica)."
+    "/coordep (Engenharia de Produção), /coordec (Engenharia Civil), /coordem (Engenharia Mecânica). "
+    "Cada trecho do contexto começa com [Fonte: título do documento]. Ao final da resposta, em uma linha "
+    "começando com \"Fonte:\", cite apenas os títulos dos documentos que você realmente usou, exatamente como "
+    "aparecem no contexto. Não coloque citações no meio do texto, só nessa linha final. Se não usou nenhum "
+    "trecho do contexto, não escreva a linha de fonte."
 )
 TELEGRAM_MAX_LEN = 4000
 MAX_CERTIFICATE_BYTES = 10 * 1024 * 1024
+MAX_VOICE_SECONDS = 180
 ERROR_REPLY = "Desculpe, tive um problema para gerar a resposta agora. Tente novamente em instantes."
 logger.info("Prompt carregado: %r", SYSTEM_INSTRUCTION)
 logger.info("Provedores de geração: %s", [p["name"] for p in llm.get_providers()])
@@ -72,6 +80,7 @@ COMMANDS_TEXT = (
     "/faq - Perguntas frequentes\n"
     "/feedback - Envia um feedback anônimo\n"
     "/horas - Mostra (e permite apagar) suas horas complementares registradas\n"
+    "/comoentregar - Passo a passo para entregar suas horas complementares\n"
     "/coordcc - Contato da coordenação de Ciência da Computação\n"
     "/coordes - Contato da coordenação de Engenharia de Software\n"
     "/coordep - Contato da coordenação de Engenharia de Produção\n"
@@ -81,7 +90,7 @@ COMMANDS_TEXT = (
 )
 
 #Functions
-async def retrieve_context(question: str, course_prefix: str | None, n_results: int = 10) -> list[str] | None:
+async def retrieve_context(question: str, course_prefix: str | None, n_results: int = 10) -> list[tuple[str, str]] | None:
     try:
         embed_response = await gemini_client.aio.models.embed_content(
             model=EMBEDDING_MODEL,
@@ -94,8 +103,12 @@ async def retrieve_context(question: str, course_prefix: str | None, n_results: 
             n_results=n_results,
             where={"course": course_prefix} if course_prefix else None,
         )
-        documents = results.get("documents") or []
-        return documents[0] if documents else []
+        documents = (results.get("documents") or [[]])[0]
+        metadatas = (results.get("metadatas") or [[]])[0]
+        return [
+            (text, fontes.doc_title((metadata or {}).get("filename")))
+            for text, metadata in zip(documents, metadatas)
+        ]
     except APIError as e:
         logger.warning("Falha ao buscar contexto no RAG: %s", e)
         return None
@@ -114,7 +127,7 @@ def split_message(text: str, limit: int = TELEGRAM_MAX_LEN) -> list[str]:
     return parts
 
 
-def build_messages(chat_id: int, user_text: str, chunks: list[str] | None, course: str | None) -> list[dict]:
+def build_messages(chat_id: int, user_text: str, chunks: list[tuple[str, str]] | None, course: str | None) -> list[dict]:
     system = SYSTEM_INSTRUCTION
     if course:
         system += f"\n\nCurso registrado do aluno: {course}."
@@ -124,6 +137,10 @@ def build_messages(chat_id: int, user_text: str, chunks: list[str] | None, cours
             "\n\nHoras complementares que o próprio aluno registrou no bot (estimativa, ainda não validada "
             f"pela coordenação; os tetos de cada grupo já foram aplicados):\n{hours_summary}"
         )
+    if "hora" in llm.normalize(user_text):
+        hours_suggestions = horas.suggestions(chat_id, course)
+        if hours_suggestions:
+            system += f"\n\n{hours_suggestions}"
     messages = [{"role": "system", "content": system}]
     for role, content in db.get_history(chat_id, limit=HISTORY_LIMIT):
         messages.append({"role": "assistant" if role == "model" else "user", "content": content})
@@ -133,7 +150,7 @@ def build_messages(chat_id: int, user_text: str, chunks: list[str] | None, cours
     elif not chunks:
         context_block = "(Nenhum trecho relevante encontrado nos documentos oficiais.)"
     else:
-        context_block = "\n\n---\n\n".join(chunks)
+        context_block = "\n\n---\n\n".join(f"[Fonte: {title}]\n{text}" for text, title in chunks)
     messages.append({
         "role": "user",
         "content": f"Contexto de documentos oficiais da UFC Russas:\n{context_block}\n\nPergunta do aluno: {user_text}",
@@ -162,7 +179,30 @@ async def generate_reply(chat_id: int, user_text: str, course: str | None) -> tu
 
 #Application Handlers
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_text = update.message.text
+    await process_text(update, context, update.message.text)
+
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    audio = update.message.voice or update.message.audio
+    if audio.duration and audio.duration > MAX_VOICE_SECONDS:
+        await update.message.reply_text("Esse áudio é longo demais (máximo 3 minutos). Tente mandar um áudio mais curto ou escrever.")
+        return
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    try:
+        telegram_file = await audio.get_file()
+        data = bytes(await telegram_file.download_as_bytearray())
+    except Exception:
+        logger.exception("Falha ao baixar áudio de %s", update.effective_chat.id)
+        data = None
+    text = await llm.transcribe(data, getattr(audio, "file_name", None) or "audio.ogg") if data else None
+    if not text:
+        await update.message.reply_text("Não consegui entender esse áudio. Pode tentar de novo ou escrever sua pergunta?")
+        return
+    await update.message.reply_text(f"Você disse: \"{text}\"")
+    await process_text(update, context, text)
+
+
+async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, user_text: str) -> None:
     chat_id = update.effective_chat.id
 
     if chat_id in awaiting_feedback:
@@ -286,8 +326,10 @@ async def handle_certificate(update: Update, context: ContextTypes.DEFAULT_TYPE)
 def hours_listing(chat_id: int) -> tuple[str, InlineKeyboardMarkup | None]:
     course = db.get_course(chat_id)
     entries = db.list_complementary_hours(chat_id)
+    hints = horas.suggestions(chat_id, course)
     if not entries:
-        return "Você ainda não registrou nenhuma atividade. Mande um certificado em PDF ou foto, ou me conte uma atividade que você fez.", None
+        text = "Você ainda não registrou nenhuma atividade. Mande um certificado em PDF ou foto, ou me conte uma atividade que você fez."
+        return (f"{text}\n\n{hints}" if hints else text), None
     lines = ["Atividades registradas:"]
     buttons = []
     for number, (entry_id, group, name, hours) in enumerate(entries, start=1):
@@ -296,12 +338,26 @@ def hours_listing(chat_id: int) -> tuple[str, InlineKeyboardMarkup | None]:
     summary = horas.summary(chat_id, course)
     if summary:
         lines.append(f"\nTotal por grupo (estimativa; a validação oficial é da coordenação):\n{summary}")
+    if hints:
+        lines.append(f"\n{hints}")
+    lines.append("\nPara saber como entregar na coordenação, use /comoentregar.")
     return "\n".join(lines), InlineKeyboardMarkup(buttons)
 
 
 async def hours_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text, keyboard = hours_listing(update.effective_chat.id)
     await update.message.reply_text(text, reply_markup=keyboard)
+
+
+async def submission_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    course = db.get_course(update.effective_chat.id)
+    if not course:
+        text = "Me diga qual é o seu curso (por exemplo: \"sou de Engenharia de Software\") e use /comoentregar de novo."
+    elif not horas.supports(course):
+        text = f"Ainda não tenho o regulamento de atividades complementares de {course}. Procure a coordenação do seu curso."
+    else:
+        text = horas.COURSE_RULES[course]["submission"]
+    await update.message.reply_text(text)
 
 
 async def handle_hours_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -344,7 +400,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(text, parse_mode="Markdown")
 async def handle_unsupported(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Desculpe, só consigo entender mensagens de texto e certificados em PDF ou foto."
+        "Desculpe, só consigo entender mensagens de texto, áudios e certificados em PDF ou foto."
     )
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
@@ -363,10 +419,41 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def faq(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "*Perguntas Frequentes*\n\n"
-        "*[PERGUNTA 1 - preencher]*\n"
-        "[RESPOSTA 1 - preencher]\n\n"
-        "*[PERGUNTA 2 - preencher]*\n"
-        "[RESPOSTA 2 - preencher]\n\n"
+        "*Quantas horas complementares eu preciso?*\n"
+        "Ciência da Computação: 192h. Engenharia de Software: 288h. Engenharia Civil: 60h. "
+        "Engenharia de Produção: 60h. Engenharia Mecânica: confirme com a coordenação (/coordem).\n\n"
+        "*Como registro e acompanho minhas horas aqui?*\n"
+        "Mande o certificado em PDF ou foto, ou me conte a atividade (ex.: \"fiz um curso de 40h\"). "
+        "Eu calculo pelo regulamento do seu curso e salvo depois da sua confirmação. Use /horas para ver o total.\n\n"
+        "*Como entrego as horas para a coordenação?*\n"
+        "Use /comoentregar para ver o passo a passo do seu curso.\n\n"
+        "*Perdi uma prova. Tenho direito a segunda chamada?*\n"
+        "Sim, desde que você peça por escrito em até 3 dias úteis depois da prova (Regimento Geral, art. 110, § 3º), "
+        "usando o requerimento de segunda chamada do Campus de Russas.\n\n"
+        "*Quantas faltas posso ter?*\n"
+        "A frequência mínima é de 75%. Duas reprovações por falta na mesma disciplina, ou quatro no total, "
+        "bloqueiam a matrícula do semestre seguinte. Depois de assinar o termo de compromisso para desbloquear, "
+        "mais uma reprovação por falta cancela a matrícula. Isso não vale para TCC/monografia, estágio e projeto final "
+        "(Resolução 12/CEPE/2008).\n\n"
+        "*Posso trancar o curso?*\n"
+        "O trancamento total vale por doença, mudança de cidade, trabalho com horário incompatível ou serviço militar, "
+        "com comprovação. Peça na coordenação (em caso de doença, na perícia da UFC) durante a matrícula ou em até "
+        "15 dias depois do fato. No primeiro semestre do curso, só por doença ou serviço militar "
+        "(Portarias 47 e 48/2019 da Prograd).\n\n"
+        "*Posso aproveitar disciplinas que já cursei?*\n"
+        "Sim, pedindo aproveitamento de estudos na coordenação, no período do calendário, com histórico e planos "
+        "de ensino. Disciplinas feitas antes de entrar no curso devem ser pedidas até o semestre seguinte ao seu "
+        "ingresso (Portaria 103/2019 da Prograd).\n\n"
+        "*Onde vejo notas, histórico e atestado de matrícula?*\n"
+        "No SIGAA, onde também é feita a matrícula.\n\n"
+        "*Como crio meu e-mail institucional?*\n"
+        "Depois do cadastro no SIGAA, acesse webmail.ufc.br e crie sua conta @alu.ufc.br.\n\n"
+        "*Onde encontro apoio psicológico?*\n"
+        "A Assistência Estudantil do Campus de Russas atende por agendamento: (88) 3411-9235 "
+        "ou pelo Instagram @ae.ufcrussas.\n\n"
+        "*Como consigo bolsas e auxílios?*\n"
+        "Os auxílios da PRAE exigem o Cadastro Socioeconômico; os editais (como a Bolsa de Iniciação Acadêmica) "
+        "saem no site da PRAE. Bolsas como PET e monitoria são divulgadas pela coordenação do curso.\n\n"
         "Não achou sua dúvida aqui? Pode me perguntar diretamente!"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
@@ -456,6 +543,7 @@ def main() -> None:
     application.add_handler(CommandHandler("faq", faq))
     application.add_handler(CommandHandler("feedback", feedback_command))
     application.add_handler(CommandHandler("horas", hours_command))
+    application.add_handler(CommandHandler("comoentregar", submission_command))
     application.add_handler(CommandHandler("coordcc", coordcc))
     application.add_handler(CommandHandler("coordes", coordes))
     application.add_handler(CommandHandler("coordep", coordep))
@@ -464,6 +552,7 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(MessageHandler(filters.PHOTO | filters.Document.PDF | filters.Document.IMAGE, handle_certificate))
     application.add_handler(CallbackQueryHandler(handle_hours_callback, pattern=r"^hrs:"))
+    application.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     application.add_handler(MessageHandler(filters.ALL & ~filters.TEXT, handle_unsupported))
 
 
