@@ -1,5 +1,6 @@
 #Imports
 import logging
+import html
 import os
 import re
 import asyncio
@@ -125,6 +126,22 @@ async def retrieve_context(question: str, course_prefix: str | None, n_results: 
         return None
 
 
+def to_telegram_html(text: str) -> str:
+    text = html.escape(text, quote=False)
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text, flags=re.S)
+    text = re.sub(r"^#{1,6}\s*(.+)$", r"<b>\1</b>", text, flags=re.M)
+    text = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", text)
+    return text.replace("**", "")
+
+
+async def send_formatted(update: Update, text: str) -> None:
+    for part in split_message(text):
+        try:
+            await update.message.reply_text(to_telegram_html(part), parse_mode="HTML")
+        except BadRequest:
+            await update.message.reply_text(re.sub(r"\*\*|`|^#{1,6}\s*", "", part, flags=re.M))
+
+
 def split_message(text: str, limit: int = TELEGRAM_MAX_LEN) -> list[str]:
     parts = []
     while len(text) > limit:
@@ -247,8 +264,7 @@ async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, user_
         logger.info("Resposta para %s gerada por %s", chat_id, provider)
         db.save_message(chat_id, "user", user_text)
         db.save_message(chat_id, "model", reply_text)
-    for part in split_message(reply_text):
-        await update.message.reply_text(part)
+    await send_formatted(update, reply_text)
 
 
 async def send_hours_confirmation(
