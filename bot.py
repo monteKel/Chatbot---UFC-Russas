@@ -253,7 +253,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not text:
         await update.message.reply_text("Não consegui entender esse áudio. Pode tentar de novo ou escrever sua pergunta?")
         return
-    await update.message.reply_text(f"Você disse: \"{text}\"")
     await process_text(update, context, text)
 
 
