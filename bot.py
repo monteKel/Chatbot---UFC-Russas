@@ -71,11 +71,17 @@ EMBEDDING_TIMEOUT_MS = 15_000
 # Keeps prompts under Groq's 8K tokens/minute free limit even after several long answers.
 MAX_HISTORY_CHARS = 4000
 MAX_HISTORY_MESSAGE_CHARS = 1200
+# Whole prompt budget (~3 chars/token in the denser PDFs), leaving room for the answer.
+MAX_PROMPT_CHARS = 19000
+MIN_HISTORY_MESSAGES = 2
+MIN_CONTEXT_CHUNKS = 6
 MAX_LISTED_ACTIVITIES = 30
 # Certificates are analysed one at a time for everyone, so one student can't queue an unbounded batch.
 MAX_CERTIFICATES_IN_FLIGHT = 5
 _certificates_in_flight: dict[int, int] = {}
-EMPTY_SOURCE_LINE = re.compile(r"\n+\W*fonte\W*:?\W*\(?\s*(nenhum|nenhuma|n/a|-)[^\n]*\s*$", re.IGNORECASE)
+SOURCE_LINE = re.compile(r"^\W*fontes?\W*:(.*)$", re.IGNORECASE)
+# gpt-oss marks citations inline like 【Fonte: ...】 even when told not to.
+INLINE_CITATION = re.compile(r"\s*【[^】]*】")
 ERROR_REPLY = "Desculpe, tive um problema para gerar a resposta agora. Tente novamente em instantes."
 logger.info("Prompt carregado: %r", SYSTEM_INSTRUCTION)
 logger.info("Provedores de geração: %s", [p["name"] for p in llm.get_providers()])
@@ -197,16 +203,30 @@ def build_messages(chat_id: int, user_text: str, chunks: list[tuple[str, str]] |
         hours_suggestions = horas.suggestions(chat_id, course)
         if hours_suggestions:
             system += f"\n\n{hours_suggestions}"
+    history = _bounded_history(chat_id)
+    kept_chunks = list(chunks or [])
+
+    def prompt_chars() -> int:
+        return (len(system) + len(user_text) + sum(len(content) for _, content in history)
+                + sum(len(text) + len(title) + 20 for text, title in kept_chunks))
+
+    # Over budget: drop the oldest history first, then the least relevant chunks (Chroma returns
+    # them most relevant first).
+    while prompt_chars() > MAX_PROMPT_CHARS and len(history) > MIN_HISTORY_MESSAGES:
+        history.pop(0)
+    while prompt_chars() > MAX_PROMPT_CHARS and len(kept_chunks) > MIN_CONTEXT_CHUNKS:
+        kept_chunks.pop()
+
     messages = [{"role": "system", "content": system}]
-    for role, content in _bounded_history(chat_id):
+    for role, content in history:
         messages.append({"role": "assistant" if role == "model" else "user", "content": content})
 
     if chunks is None:
         context_block = "(Não foi possível consultar os documentos oficiais agora. Não invente informações.)"
-    elif not chunks:
+    elif not kept_chunks:
         context_block = "(Nenhum trecho relevante encontrado nos documentos oficiais.)"
     else:
-        context_block = "\n\n---\n\n".join(f"[Fonte: {title}]\n{text}" for text, title in chunks)
+        context_block = "\n\n---\n\n".join(f"[Fonte: {title}]\n{text}" for text, title in kept_chunks)
     messages.append({
         "role": "user",
         "content": f"Contexto de documentos oficiais da UFC Russas:\n{context_block}\n\nPergunta do aluno: {user_text}",
@@ -232,8 +252,22 @@ async def generate_reply(chat_id: int, user_text: str, course: str | None) -> tu
     messages = build_messages(chat_id, user_text, retrieved_chunks, course)
     reply_text, provider = await llm.answer(messages)
     if reply_text:
-        reply_text = EMPTY_SOURCE_LINE.sub("", reply_text).rstrip()
+        reply_text = clean_source_line(reply_text, [title for _, title in retrieved_chunks or []])
     return reply_text, provider
+
+
+def clean_source_line(reply: str, titles: list[str]) -> str:
+    """Drops a trailing "Fonte:" line unless it names a document that was actually in the context
+    (the model sometimes leaves it empty, writes "nenhum" or makes one up)."""
+    reply = INLINE_CITATION.sub("", reply)
+    lines = reply.rstrip().split("\n")
+    match = SOURCE_LINE.match(lines[-1].strip())
+    if not match:
+        return reply.rstrip()
+    cited = llm.normalize(match.group(1))
+    if any(llm.normalize(title.split(" (")[0]) in cited for title in titles):
+        return reply.rstrip()
+    return "\n".join(lines[:-1]).rstrip()
 
 
 class TemporaryMessage:

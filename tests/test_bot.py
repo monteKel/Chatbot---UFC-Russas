@@ -71,13 +71,52 @@ def test_to_telegram_html():
     assert bot.to_telegram_html("sem **fechar") == "sem fechar"
 
 
-@pytest.mark.parametrize("text,expected", [
-    ("Use /horas.\n\nFonte: (nenhum trecho específico usado)", "Use /horas."),
-    ("Texto.\n\n**Fonte:** nenhuma", "Texto."),
-    ("Texto.\n\nFonte: Regulamento X (2019)", "Texto.\n\nFonte: Regulamento X (2019)"),
+TITLES = ["Regulamento de TCC de Engenharia de Software (2024.1)", "Projeto Pedagógico de Engenharia de Software (2017)"]
+
+
+@pytest.mark.parametrize("text,titles,expected", [
+    ("Tudo bem! Como posso ajudar?\n\nFonte:     ", TITLES, "Tudo bem! Como posso ajudar?"),
+    ("Tudo bem!\n\n**Fonte:**", TITLES, "Tudo bem!"),
+    ("Use /horas.\n\nFonte: (nenhum trecho específico usado)", TITLES, "Use /horas."),
+    ("Texto.\n\nFonte: Manual Inventado de Coisas (2030)", TITLES, "Texto."),
+    ("Texto.\n\nFonte: Regulamento de TCC de Engenharia de Software (2024.1)", TITLES,
+     "Texto.\n\nFonte: Regulamento de TCC de Engenharia de Software (2024.1)"),
+    ("Texto.\n\n**Fonte:** regulamento de tcc de engenharia de software", TITLES,
+     "Texto.\n\n**Fonte:** regulamento de tcc de engenharia de software"),
+    ("Texto.\n\nFonte: Regulamento de TCC de Engenharia de Software (2024.1)", [], "Texto."),
+    ("Texto sem fonte.", TITLES, "Texto sem fonte."),
+    ("A fonte: do problema é outra coisa no meio.\nFim.", TITLES, "A fonte: do problema é outra coisa no meio.\nFim."),
 ])
-def test_empty_source_line_removed(text, expected):
-    assert bot.EMPTY_SOURCE_LINE.sub("", text).rstrip() == expected
+def test_clean_source_line(text, titles, expected):
+    assert bot.clean_source_line(text, titles) == expected
+
+
+def test_inline_citation_brackets_are_removed():
+    text = ("São **288 horas**.【Fonte: Projeto Pedagógico de Engenharia de Software (2017)】\n\n"
+            "Fonte: Projeto Pedagógico de Engenharia de Software (2017)【Fonte: Projeto Pedagógico de Engenharia de Software (2017)】")
+    assert bot.clean_source_line(text, TITLES) == (
+        "São **288 horas**.\n\nFonte: Projeto Pedagógico de Engenharia de Software (2017)")
+
+
+def test_prompt_budget_drops_old_history_then_weak_chunks():
+    for i in range(3):
+        db.save_message(1, "user", f"pergunta {i} " + "q" * 1100)
+        db.save_message(1, "model", f"resposta {i} " + "r" * 1100)
+    chunks = [(f"trecho {i} " + "c" * 1500, f"Doc {i}") for i in range(10)]
+    messages = bot.build_messages(1, "pergunta nova", chunks, CC)
+    total = sum(len(m["content"]) for m in messages)
+    assert total <= bot.MAX_PROMPT_CHARS + 500
+    context = messages[-1]["content"]
+    assert "trecho 0 " in context                                  # most relevant chunk kept
+    assert context.count("[Fonte:") >= bot.MIN_CONTEXT_CHUNKS
+    assert len(messages) - 2 >= bot.MIN_HISTORY_MESSAGES            # recent history kept
+
+
+def test_reply_without_used_documents_has_no_empty_source(chunks):
+    llm._providers = [provider("groq", [completion("Tudo bem! Como posso ajudar?\n\nFonte:   ")])]
+    recorder = Recorder()
+    run(bot.process_text(make_update(recorder), CONTEXT, "oi tudo bem"))
+    assert recorder.visible == ["Tudo bem! Como posso ajudar?"]
 
 
 @pytest.mark.parametrize("handler", [bot.start, bot.help_command, bot.faq, bot.coordcc, bot.coordes, bot.coordep,

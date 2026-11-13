@@ -96,6 +96,21 @@ def test_bad_request_and_too_large_fall_back_without_pause():
         assert "groq" not in llm._cooldown_until
 
 
+def test_too_large_request_retries_with_smaller_answer_budget():
+    too_large = status_error(openai.APIStatusError, 413, message=(
+        "Error code: 413 - Request too large for model on tokens per minute (TPM): Limit 8000, Requested 8429"))
+    llm._providers = [provider("groq", [too_large, completion("coube")], max_tokens=1800), provider("openrouter")]
+    assert run(llm.answer(MESSAGES)) == ("coube", "groq")
+    calls = llm._providers[0]["client"].calls
+    assert [c["max_tokens"] for c in calls] == [1800, 1800 - 429 - 50]
+
+
+def test_too_large_prompt_that_cannot_fit_falls_back():
+    too_large = status_error(openai.APIStatusError, 413, message="Limit 8000, Requested 9900")
+    llm._providers = [provider("groq", [too_large], max_tokens=1800), provider("openrouter", [completion("reserva")])]
+    assert run(llm.answer(MESSAGES)) == ("reserva", "openrouter")
+
+
 def test_empty_or_malformed_response_falls_back():
     llm._providers = [provider("groq", [completion(None)]), provider("openrouter", [completion("ok")])]
     assert run(llm.answer(MESSAGES)) == ("ok", "openrouter")

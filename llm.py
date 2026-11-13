@@ -172,6 +172,27 @@ async def _create(provider: dict, messages: list[dict], tools: list[dict] | None
                 raise
             budget -= wait
             await asyncio.sleep(wait)
+        except APIStatusError as e:
+            # Groq counts prompt + max_tokens against the 8K TPM limit and answers 413 with the exact
+            # overflow, so retry with a smaller answer budget when that leaves enough room.
+            smaller = _max_tokens_that_fit(e, kwargs["max_tokens"])
+            if smaller is None:
+                raise
+            logger.info("%s: pedido grande demais, tentando de novo com max_tokens=%d", provider["name"], smaller)
+            kwargs["max_tokens"] = smaller
+
+
+_TOO_LARGE = re.compile(r"Limit (\d+), Requested (\d+)")
+MIN_ANSWER_TOKENS = 500
+
+
+def _max_tokens_that_fit(error: APIStatusError, max_tokens: int) -> int | None:
+    match = _TOO_LARGE.search(str(error)) if error.status_code == 413 else None
+    if not match:
+        return None
+    limit, requested = int(match.group(1)), int(match.group(2))
+    smaller = max_tokens - (requested - limit) - 50
+    return smaller if MIN_ANSWER_TOKENS <= smaller < max_tokens else None
 
 
 async def _with_failover(

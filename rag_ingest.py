@@ -2,6 +2,7 @@ import os
 import re
 import sys
 import time
+import unicodedata
 from pathlib import Path
 
 import chromadb
@@ -78,10 +79,26 @@ chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
 collection = chroma_client.get_or_create_collection("ufc_russas_docs")
 
 
+# LaTeX-generated PDFs (e.g. the ES internship manuals) come out of pypdf with the accent split from
+# its letter ("est´ agio", "Introdu¸ c˜ ao", "N ´ ıvel") and table-of-contents dot leaders, which
+# break retrieval and cost about twice as many tokens per character.
+_COMBINING = {"´": "́", "˜": "̃", "ˆ": "̂", "`": "̀", "¨": "̈", "¸": "̧"}
+_SPLIT_ACCENT_DOTLESS_I = re.compile(r" ?([´˜ˆ`¨]) ?ı")
+_SPLIT_ACCENT = re.compile(r"([´˜ˆ`¨¸]) ?([A-Za-z])")
+_DOT_LEADERS = re.compile(r"(?:\. ?){4,}")
+
+
+def clean_text(text: str) -> str:
+    text = re.sub(r"\s+", " ", text)
+    text = _SPLIT_ACCENT_DOTLESS_I.sub(lambda m: unicodedata.normalize("NFC", "i" + _COMBINING[m.group(1)]), text)
+    text = _SPLIT_ACCENT.sub(lambda m: unicodedata.normalize("NFC", m.group(2) + _COMBINING[m.group(1)]), text)
+    text = _DOT_LEADERS.sub(" ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def extract_text(pdf_path: Path) -> str:
     reader = PdfReader(str(pdf_path))
-    text = "\n".join(page.extract_text() or "" for page in reader.pages)
-    return re.sub(r"\s+", " ", text).strip()
+    return clean_text("\n".join(page.extract_text() or "" for page in reader.pages))
 
 
 def chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
@@ -130,14 +147,18 @@ def embed_batch(texts: list[str], tries: int = 6) -> list[list[float]]:
             time.sleep(delay)
 
 
-def ingest_file(course: str, folder: Path, filename: str) -> None:
+def ingest_file(course: str, folder: Path, filename: str, force: bool = False) -> None:
     chunks = chunk_text(extract_text(folder / filename))
     ids = [f"{course}:{filename}:{i}" for i in range(len(chunks))]
 
-    existing = collection.get(ids=ids)
-    if len(existing["ids"]) == len(ids):
-        print(f"{filename}: já ingerido ({len(chunks)} chunks), pulando")
-        return
+    if force:
+        # The chunk count can change after cleaning, so drop every old chunk of this file first.
+        collection.delete(where={"$and": [{"course": course}, {"filename": filename}]})
+    else:
+        existing = collection.get(ids=ids)
+        if len(existing["ids"]) == len(ids):
+            print(f"{filename}: já ingerido ({len(chunks)} chunks), pulando")
+            return
 
     metadatas = [{"course": course, "filename": filename, "chunk_index": i} for i in range(len(chunks))]
     for i in range(0, len(chunks), EMBED_BATCH_SIZE):
@@ -154,12 +175,15 @@ def ingest_file(course: str, folder: Path, filename: str) -> None:
     print(f"{filename}: {len(chunks)} chunks ingeridos")
 
 
-def ingest_course(course: str, filenames: list[str]) -> None:
+def ingest_course(course: str, filenames: list[str], force: bool = False) -> None:
     folder = DOCS_ROOT / COURSE_FOLDERS[course]
     for filename in filenames:
-        ingest_file(course, folder, filename)
+        ingest_file(course, folder, filename, force)
 
 
 if __name__ == "__main__":
-    course = sys.argv[1] if len(sys.argv) > 1 else "cc"
-    ingest_course(course, COURSE_FILES[course])
+    # python rag_ingest.py es                     -> ingere o que faltar do curso
+    # python rag_ingest.py es --force a.pdf b.pdf -> reprocessa só esses arquivos
+    args = [a for a in sys.argv[1:] if a != "--force"]
+    course = args[0] if args else "cc"
+    ingest_course(course, args[1:] or COURSE_FILES[course], force="--force" in sys.argv)
