@@ -91,6 +91,7 @@ class Pending:
     activities: list[Activity]
     source: str
     file_id: str | None
+    course: str
     created: float = field(default_factory=time.monotonic)
 
 
@@ -144,14 +145,29 @@ def _redact(text: str) -> str:
     return _LONG_NUMBER.sub("[número]", _CPF.sub("[CPF]", text))
 
 
+_NUMBER_IN_TEXT = re.compile(r"^\s*(\d+(?:[.,]\d+)?)\s*h?\s*$", re.IGNORECASE)
+_ROMAN_TO_INT = {numeral: number for number, numeral in ROMAN.items()}
+
+
 def _number(value) -> float | None:
+    # Models sometimes send numbers as strings ("20", "20,5", "12 h").
+    if isinstance(value, str) and (match := _NUMBER_IN_TEXT.match(value)):
+        value = float(match.group(1).replace(",", "."))
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     return float(value) if value >= 0 else None
 
 
+def _group(value) -> int | None:
+    if isinstance(value, str):
+        token = value.strip().upper().removeprefix("GRUPO").strip()
+        value = _ROMAN_TO_INT.get(token, token)
+    number = _number(value)
+    return int(number) if number is not None and number.is_integer() else None
+
+
 def _parse(args: dict, groups: dict) -> Activity | None:
-    group = args.get("group")
+    group = _group(args.get("group"))
     name = str(args.get("activity_name") or "").strip()
     if group not in groups or not name:
         return None
@@ -200,12 +216,12 @@ def describe(activity: Activity, course: str) -> str:
     return "\n".join(lines)
 
 
-def add_pending(chat_id: int, activities: list[Activity], source: str, file_id: str | None) -> str:
+def add_pending(chat_id: int, activities: list[Activity], source: str, file_id: str | None, course: str) -> str:
     now = time.monotonic()
     for token in [t for t, p in _pending.items() if now - p.created > PENDING_TTL]:
         del _pending[token]
     token = secrets.token_hex(4)
-    _pending[token] = Pending(chat_id, activities, source, file_id)
+    _pending[token] = Pending(chat_id, activities, source, file_id, course)
     return token
 
 
@@ -228,6 +244,7 @@ def save(pending: Pending) -> None:
             source=pending.source,
             file_id=pending.file_id,
             explanation=activity.explanation,
+            course=pending.course,
         )
 
 
@@ -235,7 +252,7 @@ def suggestions(chat_id: int, course: str | None) -> str | None:
     if not supports(course):
         return None
     rules = COURSE_RULES[course]
-    by_group = db.hours_by_group(chat_id)
+    by_group = db.hours_by_group(chat_id, course)
     total = sum(min(by_group.get(group, 0.0), cap) for group, (_, cap) in rules["groups"].items())
     if total >= rules["total"]:
         return None
@@ -250,7 +267,7 @@ def suggestions(chat_id: int, course: str | None) -> str | None:
 def summary(chat_id: int, course: str | None) -> str | None:
     if not supports(course):
         return None
-    by_group = db.hours_by_group(chat_id)
+    by_group = db.hours_by_group(chat_id, course)
     if not by_group:
         return None
     rules = COURSE_RULES[course]

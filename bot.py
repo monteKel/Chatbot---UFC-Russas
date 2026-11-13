@@ -64,13 +64,24 @@ TELEGRAM_MAX_LEN = 4000
 MAX_CERTIFICATE_BYTES = 10 * 1024 * 1024
 MAX_VOICE_SECONDS = 180
 CERTIFICATE_TIMEOUT = 300
+# Text messages may need course detection + certificate-style extraction (which waits out the
+# Groq token window) + the answer itself.
+MESSAGE_TIMEOUT = 90
+EMBEDDING_TIMEOUT_MS = 15_000
+# Keeps prompts under Groq's 8K tokens/minute free limit even after several long answers.
+MAX_HISTORY_CHARS = 4000
+MAX_HISTORY_MESSAGE_CHARS = 1200
+MAX_LISTED_ACTIVITIES = 30
+# Certificates are analysed one at a time for everyone, so one student can't queue an unbounded batch.
+MAX_CERTIFICATES_IN_FLIGHT = 5
+_certificates_in_flight: dict[int, int] = {}
 EMPTY_SOURCE_LINE = re.compile(r"\n+\W*fonte\W*:?\W*\(?\s*(nenhum|nenhuma|n/a|-)[^\n]*\s*$", re.IGNORECASE)
 ERROR_REPLY = "Desculpe, tive um problema para gerar a resposta agora. Tente novamente em instantes."
 logger.info("Prompt carregado: %r", SYSTEM_INSTRUCTION)
 logger.info("Provedores de geração: %s", [p["name"] for p in llm.get_providers()])
 
 #Gemini (embeddings only)
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+gemini_client = genai.Client(api_key=GEMINI_API_KEY, http_options=types.HttpOptions(timeout=EMBEDDING_TIMEOUT_MS))
 awaiting_feedback: set[int] = set()
 
 #RAG setup
@@ -124,6 +135,10 @@ async def retrieve_context(question: str, course_prefix: str | None, n_results: 
     except APIError as e:
         logger.warning("Falha ao buscar contexto no RAG: %s", e)
         return None
+    except Exception:
+        # Network errors, timeouts or Chroma failures: answer without documents instead of crashing.
+        logger.exception("Falha inesperada ao buscar contexto no RAG")
+        return None
 
 
 def to_telegram_html(text: str) -> str:
@@ -155,6 +170,19 @@ def split_message(text: str, limit: int = TELEGRAM_MAX_LEN) -> list[str]:
     return parts
 
 
+def _bounded_history(chat_id: int) -> list[tuple[str, str]]:
+    """Most recent history that fits the size budget, with long messages shortened."""
+    kept, total = [], 0
+    for role, content in reversed(db.get_history(chat_id, limit=HISTORY_LIMIT)):
+        if len(content) > MAX_HISTORY_MESSAGE_CHARS:
+            content = content[:MAX_HISTORY_MESSAGE_CHARS] + " […]"
+        if total + len(content) > MAX_HISTORY_CHARS:
+            break
+        kept.append((role, content))
+        total += len(content)
+    return list(reversed(kept))
+
+
 def build_messages(chat_id: int, user_text: str, chunks: list[tuple[str, str]] | None, course: str | None) -> list[dict]:
     system = SYSTEM_INSTRUCTION
     if course:
@@ -170,7 +198,7 @@ def build_messages(chat_id: int, user_text: str, chunks: list[tuple[str, str]] |
         if hours_suggestions:
             system += f"\n\n{hours_suggestions}"
     messages = [{"role": "system", "content": system}]
-    for role, content in db.get_history(chat_id, limit=HISTORY_LIMIT):
+    for role, content in _bounded_history(chat_id):
         messages.append({"role": "assistant" if role == "model" else "user", "content": content})
 
     if chunks is None:
@@ -261,15 +289,15 @@ async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, user_
 
     if chat_id in awaiting_feedback:
         awaiting_feedback.discard(chat_id)
-        logger.info("Feedback recebido de %s: %s", chat_id, user_text)
-        db.save_feedback(chat_id, user_text)
+        logger.info("Feedback anônimo recebido")
+        db.save_feedback(user_text)
         await update.message.reply_text("Obrigado pelo feedback!")
         return
 
     status = await TemporaryMessage.send(update, "Digitando...")
     reply_text, provider, course, activities = None, None, None, None
     try:
-        async with asyncio.timeout(50):
+        async with asyncio.timeout(MESSAGE_TIMEOUT):
             course = await resolve_course(chat_id, user_text)
             if horas.supports(course) and horas.declares_activity(user_text):
                 activities = await horas.extract(user_text, course)
@@ -277,6 +305,9 @@ async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, user_
                 reply_text, provider = await generate_reply(chat_id, user_text, course)
     except TimeoutError:
         logger.error("Tempo esgotado gerando resposta para %s", chat_id)
+    except Exception:
+        logger.exception("Erro inesperado respondendo %s", chat_id)
+        activities = None
     finally:
         await status.remove()
 
@@ -312,7 +343,7 @@ async def send_hours_confirmation(
     keyboard = None
     if complete:
         sections.append("Posso salvar no seu registro de horas? (É uma estimativa: quem valida oficialmente é a coordenação.)")
-        token = horas.add_pending(chat_id, complete, source, file_id)
+        token = horas.add_pending(chat_id, complete, source, file_id, course)
         keyboard = InlineKeyboardMarkup([[
             InlineKeyboardButton("Salvar", callback_data=f"hrs:ok:{token}"),
             InlineKeyboardButton("Cancelar", callback_data=f"hrs:no:{token}"),
@@ -320,7 +351,10 @@ async def send_hours_confirmation(
     text = "\n\n".join(sections)
     db.save_message(chat_id, "user", history_label)
     db.save_message(chat_id, "model", text)
-    await update.message.reply_text(text, reply_markup=keyboard)
+    parts = split_message(text)
+    for part in parts[:-1]:
+        await update.message.reply_text(part)
+    await update.message.reply_text(parts[-1], reply_markup=keyboard)
 
 
 async def handle_certificate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -349,6 +383,22 @@ async def handle_certificate(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await message.reply_text("Esse arquivo é grande demais (máximo 10 MB). Tente mandar uma versão menor.")
         return
 
+    if _certificates_in_flight.get(chat_id, 0) >= MAX_CERTIFICATES_IN_FLIGHT:
+        await message.reply_text(
+            f"Já estou analisando {MAX_CERTIFICATES_IN_FLIGHT} certificados seus. Espere eu terminar esses "
+            "e depois mande os próximos."
+        )
+        return
+    _certificates_in_flight[chat_id] = _certificates_in_flight.get(chat_id, 0) + 1
+    try:
+        await _analyze_certificate(update, message, chat_id, course, attachment, is_pdf)
+    finally:
+        _certificates_in_flight[chat_id] -= 1
+        if not _certificates_in_flight[chat_id]:
+            del _certificates_in_flight[chat_id]
+
+
+async def _analyze_certificate(update: Update, message, chat_id: int, course: str, attachment, is_pdf: bool) -> None:
     file_name = getattr(attachment, "file_name", None)
     label = f"\"{file_name}\"" if file_name else "sua foto"
     if horas.extraction_busy():
@@ -406,18 +456,40 @@ def hours_listing(chat_id: int) -> tuple[str, InlineKeyboardMarkup | None]:
     if not entries:
         text = "Você ainda não registrou nenhuma atividade. Mande um certificado em PDF ou foto, ou me conte uma atividade que você fez."
         return (f"{text}\n\n{hints}" if hints else text), None
+    shown = entries[-MAX_LISTED_ACTIVITIES:]
+    first_number = len(entries) - len(shown) + 1
     lines = ["Atividades registradas:"]
+    if len(entries) > len(shown):
+        lines[0] = f"Atividades registradas (mostrando as {len(shown)} mais recentes de {len(entries)}):"
     buttons = []
-    for number, (entry_id, group, name, hours) in enumerate(entries, start=1):
-        lines.append(f"{number}. {name} (Grupo {horas.ROMAN.get(group, group)}): {horas.fmt(hours)}h")
+    for number, (entry_id, group, name, hours, entry_course) in enumerate(shown, start=first_number):
+        note = f" [registrada como {entry_course}, não conta no total]" if entry_course and entry_course != course else ""
+        lines.append(f"{number}. {name[:60]} (Grupo {horas.ROMAN.get(group, group)}): {horas.fmt(hours)}h{note}")
         buttons.append([InlineKeyboardButton(f"Apagar {number}. {name[:30]}", callback_data=f"hrs:del:{entry_id}")])
+    footer = []
     summary = horas.summary(chat_id, course)
     if summary:
-        lines.append(f"\nTotal por grupo (estimativa; a validação oficial é da coordenação):\n{summary}")
+        footer.append(f"\nTotal por grupo (estimativa; a validação oficial é da coordenação):\n{summary}")
     if hints:
-        lines.append(f"\n{hints}")
-    lines.append("\nPara saber como entregar na coordenação, use /comoentregar.")
-    return "\n".join(lines), InlineKeyboardMarkup(buttons)
+        footer.append(f"\n{hints}")
+    footer.append("\nPara saber como entregar na coordenação, use /comoentregar.")
+    text = "\n".join(lines + footer)
+    if len(text) > TELEGRAM_MAX_LEN and hints:
+        footer.remove(f"\n{hints}")
+        text = "\n".join(lines + footer)
+    return text[:TELEGRAM_MAX_LEN], InlineKeyboardMarkup(buttons)
+
+
+async def _edit(query, text: str | None = None, reply_markup=None) -> None:
+    """Edits the clicked message, ignoring Telegram's "message is not modified" on repeated clicks."""
+    try:
+        if text is None:
+            await query.edit_message_reply_markup(reply_markup=reply_markup)
+        else:
+            await query.edit_message_text(text, reply_markup=reply_markup)
+    except BadRequest as error:
+        if "not modified" not in str(error).lower():
+            raise
 
 
 async def hours_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -449,23 +521,25 @@ async def handle_hours_callback(update: Update, context: ContextTypes.DEFAULT_TY
         if token.isdigit():
             db.delete_complementary_hours(chat_id, int(token))
         text, keyboard = hours_listing(chat_id)
-        await query.edit_message_text(text, reply_markup=keyboard)
+        await _edit(query, text, keyboard)
         return
     pending = horas.pop_pending(token, chat_id)
     if pending is None:
-        await query.edit_message_reply_markup(reply_markup=None)
-        await query.message.reply_text("Esse registro expirou. Mande o certificado de novo.")
+        # Already handled (double click) or lost in a restart: just drop the buttons.
+        await _edit(query, reply_markup=None)
+        if query.message.text and not query.message.text.endswith(("Salvo!", "Cancelado, nada foi salvo.")):
+            await query.message.reply_text("Esse registro expirou. Mande o certificado de novo.")
         return
     names = ", ".join(a.name for a in pending.activities)
     if action != "ok":
         db.save_message(chat_id, "user", "[Cliquei em Cancelar]")
         db.save_message(chat_id, "model", f"Cancelado, não salvei: {names}.")
-        await query.edit_message_text(f"{query.message.text}\n\nCancelado, nada foi salvo.")
+        await _edit(query, f"{query.message.text}\n\nCancelado, nada foi salvo.")
         return
     horas.save(pending)
     db.save_message(chat_id, "user", "[Cliquei em Salvar]")
     db.save_message(chat_id, "model", f"Salvei no seu registro de horas: {names}.")
-    await query.edit_message_text(f"{query.message.text}\n\nSalvo!")
+    await _edit(query, f"{query.message.text}\n\nSalvo!")
     summary = horas.summary(chat_id, db.get_course(chat_id))
     if summary:
         await query.message.reply_text(
@@ -613,37 +687,67 @@ async def feedback_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     chat_id = update.effective_chat.id
     awaiting_feedback.add(chat_id)
     await update.message.reply_text(
-        "Pode mandar seu feedback na próxima mensagem. Ele é registrado de forma anônima "
-        "(por enquanto só no log do servidor — o armazenamento permanente ainda está em desenvolvimento)."
+        "Pode mandar seu feedback na próxima mensagem. Ele é salvo de forma anônima, sem nenhuma "
+        "informação que identifique você."
     )
 
+async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("Não conheço esse comando. Use /help para ver os comandos disponíveis.")
+
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error("Erro não tratado", exc_info=context.error)
+    message = update.effective_message if isinstance(update, Update) else None
+    if message is not None:
+        try:
+            await message.reply_text(ERROR_REPLY)
+        except TelegramError:
+            pass
+
+
 #Main
-def main() -> None:
-    db.init_db()
+COMMANDS = {
+    "start": start,
+    "reset": reset,
+    "help": help_command,
+    "faq": faq,
+    "feedback": feedback_command,
+    "horas": hours_command,
+    "comoentregar": submission_command,
+    "coordcc": coordcc,
+    "coordes": coordes,
+    "coordep": coordep,
+    "coordem": coordem,
+    "coordec": coordec,
+}
+
+
+def build_application() -> Application:
     # Concurrent updates so one student's slow request (e.g. a queued certificate) doesn't block
     # everyone else or make button clicks expire. Everything still runs on one event loop thread,
     # so the shared SQLite connection stays safe.
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).concurrent_updates(True).build()
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("reset", reset))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("faq", faq))
-    application.add_handler(CommandHandler("feedback", feedback_command))
-    application.add_handler(CommandHandler("horas", hours_command))
-    application.add_handler(CommandHandler("comoentregar", submission_command))
-    application.add_handler(CommandHandler("coordcc", coordcc))
-    application.add_handler(CommandHandler("coordes", coordes))
-    application.add_handler(CommandHandler("coordep", coordep))
-    application.add_handler(CommandHandler("coordem", coordem))
-    application.add_handler(CommandHandler("coordec", coordec))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    application.add_handler(MessageHandler(filters.PHOTO | filters.Document.PDF | filters.Document.IMAGE, handle_certificate))
+    # Only new messages in private chats: edited messages have no update.message, and in a group the
+    # chat id (used as the student's identity) would be shared by everyone.
+    new_private = filters.UpdateType.MESSAGE & filters.ChatType.PRIVATE
+    for command, callback in COMMANDS.items():
+        application.add_handler(CommandHandler(command, callback, filters=new_private))
+    application.add_handler(MessageHandler(new_private & filters.COMMAND, unknown_command))
+    application.add_handler(MessageHandler(new_private & filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(MessageHandler(
+        new_private & (filters.PHOTO | filters.Document.PDF | filters.Document.IMAGE), handle_certificate))
     application.add_handler(CallbackQueryHandler(handle_hours_callback, pattern=r"^hrs:"))
-    application.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
-    application.add_handler(MessageHandler(filters.ALL & ~filters.TEXT, handle_unsupported))
+    application.add_handler(MessageHandler(new_private & (filters.VOICE | filters.AUDIO), handle_voice))
+    application.add_handler(MessageHandler(new_private & ~filters.TEXT, handle_unsupported))
+    application.add_error_handler(on_error)
+    return application
 
 
-    application.run_polling()
+def main() -> None:
+    db.init_db()
+    build_application().run_polling()
+
+
 if __name__ == "__main__":
     main()

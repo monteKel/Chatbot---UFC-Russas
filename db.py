@@ -70,6 +70,11 @@ def init_db() -> None:
     _ensure_column("complementary_hours", "source", "TEXT")
     _ensure_column("complementary_hours", "file_id", "TEXT")
     _ensure_column("complementary_hours", "explanation", "TEXT")
+    _ensure_column("complementary_hours", "course", "TEXT")
+    # Feedback saved before it was made anonymous still carried the student's chat id.
+    _conn.execute("UPDATE feedback SET chat_id = ? WHERE chat_id != ?", (ANONYMOUS_CHAT_ID, ANONYMOUS_CHAT_ID))
+    _conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages (chat_id, id)")
+    _conn.execute("CREATE INDEX IF NOT EXISTS idx_hours_chat ON complementary_hours (chat_id)")
     _conn.commit()
 
 
@@ -124,11 +129,14 @@ def get_course(chat_id: int) -> str | None:
     return row[0] if row else None
 
 
-def save_feedback(chat_id: int, content: str) -> None:
-    _ensure_user(chat_id)
+ANONYMOUS_CHAT_ID = 0
+
+
+def save_feedback(content: str) -> None:
+    # The bot promises anonymous feedback, so nothing links it back to the student.
     _conn.execute(
         "INSERT INTO feedback (chat_id, content, created_at) VALUES (?, ?, ?)",
-        (chat_id, content, datetime.now(timezone.utc).isoformat()),
+        (ANONYMOUS_CHAT_ID, content, datetime.now(timezone.utc).isoformat()),
     )
     _conn.commit()
 
@@ -143,25 +151,26 @@ def add_complementary_hours(
     source: str,
     file_id: str | None,
     explanation: str,
+    course: str | None,
 ) -> None:
     _ensure_user(chat_id)
     _conn.execute(
         """
         INSERT INTO complementary_hours
             (chat_id, activity_group, activity_item, activity_name, certificate_hours, hours,
-             status, source, file_id, explanation, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, 'registrado pelo aluno', ?, ?, ?, ?)
+             status, source, file_id, explanation, course, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'registrado pelo aluno', ?, ?, ?, ?, ?)
         """,
-        (chat_id, group, item, name, certificate_hours, credited_hours, source, file_id, explanation,
+        (chat_id, group, item, name, certificate_hours, credited_hours, source, file_id, explanation, course,
          datetime.now(timezone.utc).isoformat()),
     )
     _touch_activity(chat_id)
     _conn.commit()
 
 
-def list_complementary_hours(chat_id: int) -> list[tuple[int, int, str, float]]:
+def list_complementary_hours(chat_id: int) -> list[tuple[int, int, str, float, str | None]]:
     return _conn.execute(
-        "SELECT id, activity_group, activity_name, hours FROM complementary_hours WHERE chat_id = ? ORDER BY id",
+        "SELECT id, activity_group, activity_name, hours, course FROM complementary_hours WHERE chat_id = ? ORDER BY id",
         (chat_id,),
     ).fetchall()
 
@@ -172,11 +181,14 @@ def delete_complementary_hours(chat_id: int, entry_id: int) -> bool:
     return cursor.rowcount > 0
 
 
-def hours_by_group(chat_id: int) -> dict[int, float]:
-    rows = _conn.execute(
-        "SELECT activity_group, SUM(hours) FROM complementary_hours WHERE chat_id = ? GROUP BY activity_group",
-        (chat_id,),
-    ).fetchall()
+def hours_by_group(chat_id: int, course: str | None = None) -> dict[int, float]:
+    """Hours per group; with a course, only entries registered under it (or before courses were stored)."""
+    query = "SELECT activity_group, SUM(hours) FROM complementary_hours WHERE chat_id = ?"
+    params: tuple = (chat_id,)
+    if course is not None:
+        query += " AND (course = ? OR course IS NULL)"
+        params += (course,)
+    rows = _conn.execute(query + " GROUP BY activity_group", params).fetchall()
     return {group: total for group, total in rows}
 
 
@@ -189,7 +201,6 @@ def delete_inactive_users(days: int) -> int:
     chat_ids = [row[0] for row in rows]
     for chat_id in chat_ids:
         _conn.execute("DELETE FROM messages WHERE chat_id = ?", (chat_id,))
-        _conn.execute("DELETE FROM feedback WHERE chat_id = ?", (chat_id,))
         _conn.execute("DELETE FROM complementary_hours WHERE chat_id = ?", (chat_id,))
         _conn.execute("DELETE FROM users WHERE chat_id = ?", (chat_id,))
     _conn.commit()

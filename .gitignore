@@ -9,3 +9,7 @@ Documentos/**/ep_declaracao_*
 *.db
 *.db-journal
 chroma_db/
+# backups/variações do .env também têm chaves
+.env.*
+!.env.example
+.pytest_cache/

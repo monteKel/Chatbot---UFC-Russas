@@ -73,12 +73,14 @@ _COURSE_BY_KEY = {normalize(c): c for c in VALID_COURSES}
 _COURSE_HINT = re.compile(r"curso|comput|software|produc|civil|mecanic|engenharia|\bcc\b")
 
 
-_COURSE_KEYWORDS = {
-    "computacao": "Ciência da Computação",
-    "software": "Engenharia de Software",
-    "producao": "Engenharia de Produção",
-    "civil": "Engenharia Civil",
-    "mecanica": "Engenharia Mecânica",
+# Full course names only: bare words like "software", "produção" or "mecânica" also appear in
+# activity and subject names ("registro de software", "produção técnica", "mecânica dos solos").
+_COURSE_NAME_PATTERNS = {
+    "Ciência da Computação": re.compile(r"\bciencias? da computacao\b"),
+    "Engenharia de Software": re.compile(r"\beng(enharia|\.)? (de )?software\b"),
+    "Engenharia de Produção": re.compile(r"\beng(enharia|\.)? (de )?producao\b"),
+    "Engenharia Civil": re.compile(r"\beng(enharia|\.)? civil\b"),
+    "Engenharia Mecânica": re.compile(r"\beng(enharia|\.)? mecanica\b"),
 }
 
 
@@ -88,7 +90,7 @@ def mentions_course(text: str) -> bool:
 
 def course_named_in(text: str) -> str | None:
     normalized = normalize(text)
-    found = {course for key, course in _COURSE_KEYWORDS.items() if key in normalized}
+    found = {course for course, pattern in _COURSE_NAME_PATTERNS.items() if pattern.search(normalized)}
     return found.pop() if len(found) == 1 else None
 
 
@@ -251,7 +253,9 @@ async def answer(messages: list[dict]) -> tuple[str | None, str | None]:
             raise RuntimeError("resposta vazia")
         return choice.message.content
 
-    return await _with_failover(operation)
+    # A short Groq pause (e.g. while a certificate batch uses the token window) is worth waiting
+    # for instead of falling back to the much slower free providers.
+    return await _with_failover(operation, max_wait=SHORT_RETRY_MAX_WAIT)
 
 
 async def transcribe(audio: bytes, filename: str) -> str | None:
