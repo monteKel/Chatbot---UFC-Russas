@@ -6,10 +6,10 @@ import re
 import asyncio
 import chromadb
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, ContextTypes, filters
 from telegram.constants import ChatAction
-from telegram.error import BadRequest
+from telegram.error import BadRequest, TelegramError
 from google import genai
 from google.genai import types
 from google.genai.errors import APIError
@@ -208,6 +208,30 @@ async def generate_reply(chat_id: int, user_text: str, course: str | None) -> tu
     return reply_text, provider
 
 
+class TemporaryMessage:
+    """Status message ("Digitando...") that is deleted right before the real reply is sent."""
+
+    def __init__(self, message: Message | None):
+        self._message = message
+
+    @classmethod
+    async def send(cls, update: Update, text: str) -> "TemporaryMessage":
+        try:
+            return cls(await update.message.reply_text(text))
+        except TelegramError:
+            logger.warning("Não consegui enviar a mensagem temporária para %s", update.effective_chat.id)
+            return cls(None)
+
+    async def remove(self) -> None:
+        message, self._message = self._message, None
+        if message is None:
+            return
+        try:
+            await message.delete()
+        except TelegramError:
+            logger.info("Não consegui apagar a mensagem temporária %s", message.message_id)
+
+
 #Application Handlers
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await process_text(update, context, update.message.text)
@@ -243,20 +267,23 @@ async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, user_
         await update.message.reply_text("Obrigado pelo feedback!")
         return
 
-    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-    reply_text, provider = None, None
+    status = await TemporaryMessage.send(update, "Digitando...")
+    reply_text, provider, course, activities = None, None, None, None
     try:
         async with asyncio.timeout(50):
             course = await resolve_course(chat_id, user_text)
             if horas.supports(course) and horas.declares_activity(user_text):
                 activities = await horas.extract(user_text, course)
-                if activities:
-                    await send_hours_confirmation(update, course, activities, "texto", None, user_text)
-                    return
-            reply_text, provider = await generate_reply(chat_id, user_text, course)
+            if not activities:
+                reply_text, provider = await generate_reply(chat_id, user_text, course)
     except TimeoutError:
         logger.error("Tempo esgotado gerando resposta para %s", chat_id)
+    finally:
+        await status.remove()
 
+    if activities:
+        await send_hours_confirmation(update, course, activities, "texto", None, user_text)
+        return
     if reply_text is None:
         logger.error("Todos os provedores falharam para %s", chat_id)
         reply_text = ERROR_REPLY
@@ -323,45 +350,54 @@ async def handle_certificate(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await message.reply_text("Esse arquivo é grande demais (máximo 10 MB). Tente mandar uma versão menor.")
         return
 
-    name = getattr(attachment, "file_name", None) or "foto"
+    file_name = getattr(attachment, "file_name", None)
+    label = f"\"{file_name}\"" if file_name else "sua foto"
     if horas.extraction_busy():
-        await message.reply_text(f"Recebi \"{name}\"! Tem outros certificados na fila, já já eu analiso este.")
-    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-    try:
-        telegram_file = await attachment.get_file()
-        data = bytes(await telegram_file.download_as_bytearray())
-        text = await asyncio.to_thread(horas.read_pdf if is_pdf else horas.read_image, data)
-    except Exception:
-        logger.exception("Falha ao ler certificado de %s", chat_id)
-        await message.reply_text("Não consegui abrir esse arquivo. Tente mandar de novo, de preferência em PDF.")
-        return
-    if message.caption:
-        text = f"{text}\n\nMensagem do aluno: {message.caption}"
-    if not horas.is_readable(text):
-        await message.reply_text(
-            "Não consegui ler o texto desse arquivo. Tente uma foto mais nítida e reta, ou mande o PDF do certificado."
-        )
-        return
+        status = await TemporaryMessage.send(update, f"Recebi {label}! Tem outros certificados na fila, já já eu analiso este.")
+    else:
+        status = await TemporaryMessage.send(update, f"Analisando {label}...")
 
-    activities = None
+    async def reply(text: str) -> None:
+        await status.remove()
+        await message.reply_text(text)
+
     try:
-        async with asyncio.timeout(CERTIFICATE_TIMEOUT):
-            activities = await horas.extract(text, course)
-    except TimeoutError:
-        logger.error("Tempo esgotado extraindo certificado de %s", chat_id)
-    if activities is None:
-        await message.reply_text(f"Desculpe, não consegui analisar \"{name}\" agora. Pode mandar esse de novo daqui a pouco?")
-        return
-    if not activities:
-        await message.reply_text(
-            f"Não identifiquei em \"{name}\" uma atividade complementar que se encaixe nas regras do seu curso. "
-            "Se achar que é um erro, me diga qual foi a atividade e a carga horária."
+        try:
+            telegram_file = await attachment.get_file()
+            data = bytes(await telegram_file.download_as_bytearray())
+            text = await asyncio.to_thread(horas.read_pdf if is_pdf else horas.read_image, data)
+        except Exception:
+            logger.exception("Falha ao ler certificado de %s", chat_id)
+            await reply("Não consegui abrir esse arquivo. Tente mandar de novo, de preferência em PDF.")
+            return
+        if message.caption:
+            text = f"{text}\n\nMensagem do aluno: {message.caption}"
+        if not horas.is_readable(text):
+            await reply("Não consegui ler o texto desse arquivo. Tente uma foto mais nítida e reta, ou mande o PDF do certificado.")
+            return
+
+        activities = None
+        try:
+            async with asyncio.timeout(CERTIFICATE_TIMEOUT):
+                activities = await horas.extract(text, course)
+        except TimeoutError:
+            logger.error("Tempo esgotado extraindo certificado de %s", chat_id)
+        if activities is None:
+            await reply(f"Desculpe, não consegui analisar {label} agora. Pode mandar de novo daqui a pouco?")
+            return
+        if not activities:
+            await reply(
+                f"Não identifiquei em {label} uma atividade complementar que se encaixe nas regras do seu curso. "
+                "Se achar que é um erro, me diga qual foi a atividade e a carga horária."
+            )
+            return
+        await status.remove()
+        await send_hours_confirmation(
+            update, course, activities, "pdf" if is_pdf else "imagem", attachment.file_id,
+            f"[Enviei um certificado: {file_name or 'foto'}]",
         )
-        return
-    await send_hours_confirmation(
-        update, course, activities, "pdf" if is_pdf else "imagem", attachment.file_id,
-        f"[Enviei um certificado: {name}]",
-    )
+    finally:
+        await status.remove()
 
 
 def hours_listing(chat_id: int) -> tuple[str, InlineKeyboardMarkup | None]:
