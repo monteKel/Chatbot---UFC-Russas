@@ -232,6 +232,11 @@ def pop_pending(token: str, chat_id: int) -> Pending | None:
     return _pending.pop(token)
 
 
+def clear_pending(chat_id: int) -> None:
+    for token in [t for t, p in _pending.items() if p.chat_id == chat_id]:
+        del _pending[token]
+
+
 def save(pending: Pending) -> None:
     for activity in pending.activities:
         db.add_complementary_hours(

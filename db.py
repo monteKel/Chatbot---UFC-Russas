@@ -113,11 +113,6 @@ def get_history(chat_id: int, limit: int = 30) -> list[tuple[str, str]]:
     return list(reversed(rows))
 
 
-def clear_history(chat_id: int) -> None:
-    _conn.execute("DELETE FROM messages WHERE chat_id = ?", (chat_id,))
-    _conn.commit()
-
-
 def set_course(chat_id: int, course: str) -> None:
     _ensure_user(chat_id)
     _conn.execute("UPDATE users SET course = ? WHERE chat_id = ?", (course, chat_id))
@@ -200,8 +195,13 @@ def delete_inactive_users(days: int) -> int:
     ).fetchall()
     chat_ids = [row[0] for row in rows]
     for chat_id in chat_ids:
-        _conn.execute("DELETE FROM messages WHERE chat_id = ?", (chat_id,))
-        _conn.execute("DELETE FROM complementary_hours WHERE chat_id = ?", (chat_id,))
-        _conn.execute("DELETE FROM users WHERE chat_id = ?", (chat_id,))
-    _conn.commit()
+        delete_user_data(chat_id)
     return len(chat_ids)
+
+
+def delete_user_data(chat_id: int) -> None:
+    """Removes everything stored about a student (anonymous feedback isn't linked to anyone)."""
+    _conn.execute("DELETE FROM messages WHERE chat_id = ?", (chat_id,))
+    _conn.execute("DELETE FROM complementary_hours WHERE chat_id = ?", (chat_id,))
+    _conn.execute("DELETE FROM users WHERE chat_id = ?", (chat_id,))
+    _conn.commit()

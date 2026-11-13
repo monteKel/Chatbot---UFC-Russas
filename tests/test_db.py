@@ -4,14 +4,23 @@ from datetime import datetime, timedelta, timezone
 import db
 
 
-def test_history_order_limit_and_clear():
+def test_history_order_and_limit():
     for i in range(5):
         db.save_message(1, "user" if i % 2 == 0 else "model", f"m{i}")
     assert db.get_history(1, limit=3) == [("user", "m2"), ("model", "m3"), ("user", "m4")]
-    db.save_message(2, "user", "outro aluno")
-    db.clear_history(1)
-    assert db.get_history(1) == []
-    assert db.get_history(2) == [("user", "outro aluno")]
+
+
+def test_delete_user_data_removes_only_that_student():
+    for chat_id in (1, 2):
+        db.set_course(chat_id, "Engenharia Civil")
+        db.save_message(chat_id, "user", f"oi de {chat_id}")
+        db.add_complementary_hours(chat_id, 4, "c", "Curso", 8, 8, "pdf", None, "x", course="Engenharia Civil")
+    db.save_feedback("anônimo")
+    db.delete_user_data(1)
+    assert db.get_course(1) is None and db.get_history(1) == [] and db.list_complementary_hours(1) == []
+    assert db._conn.execute("SELECT COUNT(*) FROM users WHERE chat_id = 1").fetchone()[0] == 0
+    assert db.get_course(2) == "Engenharia Civil" and len(db.list_complementary_hours(2)) == 1
+    assert db._conn.execute("SELECT COUNT(*) FROM feedback").fetchone()[0] == 1
 
 
 def test_course_roundtrip():

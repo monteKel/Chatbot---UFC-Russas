@@ -516,6 +516,94 @@ def test_voice_transcription_goes_to_text_flow(monkeypatch):
     assert recorder.sent == []   # no "Você disse" echo
 
 
+# ---------- emojis ----------
+
+@pytest.mark.parametrize("text,expected", [
+    ("👍", True), ("❤️", True), ("😡😡", True), ("👍 ", True), ("?", True),
+    ("ok 👍", False), ("eu entendi irmao, mandei um emoji de ok (👍)", False), ("1️⃣", False), ("", False), ("   ", False),
+])
+def test_is_emoji_only(text, expected):
+    assert bot.is_emoji_only(text) is expected
+
+
+def test_emoji_only_message_is_a_short_reaction_without_search(chunks):
+    db.set_course(1000, CC)
+    db.save_message(1000, "user", "o projeto NEMO conta como estágio?")
+    db.save_message(1000, "model", "Não, o projeto NEMO não conta como estágio obrigatório.")
+    llm._providers = [provider("groq", [completion("Que bom que ajudou! 😊\n\nFonte:")])]
+    recorder = Recorder()
+    run(bot.process_text(make_update(recorder), CONTEXT, "👍"))
+    assert chunks == []                                   # no document search for an emoji
+    sent_prompt = llm._providers[0]["client"].calls[0]["messages"]
+    assert "só emoji" in sent_prompt[-1]["content"] and "👍" in sent_prompt[-1]["content"]
+    assert any("NEMO" in m["content"] for m in sent_prompt)  # the bot sees what it is reacting to
+    assert recorder.visible == ["Que bom que ajudou! 😊"]
+    assert db.get_history(1000)[-2:] == [("user", "👍"), ("model", "Que bom que ajudou! 😊")]
+
+
+def test_sticker_and_dice_are_answered_as_their_emoji(monkeypatch):
+    received = []
+
+    async def fake_process(update, context, text):
+        received.append(text)
+
+    monkeypatch.setattr(bot, "process_text", fake_process)
+    run(bot.handle_sticker(make_update(Recorder(), sticker=SimpleNamespace(emoji="😂")), CONTEXT))
+    run(bot.handle_sticker(make_update(Recorder(), sticker=SimpleNamespace(emoji=None)), CONTEXT))
+    run(bot.handle_sticker(make_update(Recorder(), dice=SimpleNamespace(emoji="🎲")), CONTEXT))
+    assert received == ["😂", "🙂", "🎲"]
+
+
+def test_split_message_counts_emojis_like_telegram():
+    text = "😀" * 3000          # 3000 characters but 6000 UTF-16 units
+    parts = bot.split_message(text, limit=4000)
+    assert all(bot._telegram_len(p) <= 4000 for p in parts)
+    assert "".join(parts) == text
+
+
+# ---------- /reset ----------
+
+def _reset_query(recorder, action, age_seconds=0):
+    stamp = int(bot.time.time()) - age_seconds
+    return FakeQuery(recorder, f"rst:{action}:{stamp}", "Isso apaga tudo...", InlineKeyboardMarkup([[]]))
+
+
+def test_reset_command_asks_for_confirmation():
+    recorder = Recorder()
+    run(bot.reset(make_update(recorder), CONTEXT))
+    message, markup = recorder.events[0][1], recorder.events[0][2]
+    assert "Não dá para desfazer" in message
+    assert [b.text for b in markup.inline_keyboard[0]] == ["Apagar tudo", "Cancelar"]
+
+
+def test_reset_confirmed_deletes_everything_about_the_student():
+    db.set_course(1000, CC)
+    db.save_message(1000, "user", "oi")
+    db.add_complementary_hours(1000, 4, "c", "Curso", 8, 8, "pdf", None, "x", course=CC)
+    db.add_complementary_hours(2000, 4, "c", "Outro aluno", 8, 8, "pdf", None, "x", course=CC)
+    horas.add_pending(1000, [horas.Activity(4, "c", "Pendente", 8, 8, "x", "")], "pdf", None, CC)
+    bot.awaiting_feedback.add(1000)
+    recorder = Recorder()
+    query = _reset_query(recorder, "ok")
+    run(bot.handle_reset_callback(make_callback_update(query), CONTEXT))
+    assert db.get_course(1000) is None and db.get_history(1000) == [] and db.list_complementary_hours(1000) == []
+    assert horas._pending == {} and 1000 not in bot.awaiting_feedback
+    assert len(db.list_complementary_hours(2000)) == 1
+    assert query.message.text.startswith("Pronto, apaguei tudo")
+
+
+def test_reset_cancel_and_expired_keep_data():
+    db.set_course(1000, CC)
+    recorder = Recorder()
+    cancel = _reset_query(recorder, "no")
+    run(bot.handle_reset_callback(make_callback_update(cancel), CONTEXT))
+    assert cancel.message.text == "Cancelado, não apaguei nada."
+    old = _reset_query(recorder, "ok", age_seconds=bot.RESET_CONFIRM_SECONDS + 5)
+    run(bot.handle_reset_callback(make_callback_update(old), CONTEXT))
+    assert "expirou" in old.message.text
+    assert db.get_course(1000) == CC
+
+
 # ---------- update routing ----------
 
 @pytest.fixture
@@ -550,6 +638,16 @@ def test_edited_messages_are_ignored(app):
 def test_group_chats_are_ignored(app):
     assert matching_callbacks(app, tg_update(app, "oi", chat_type="group")) == []
     assert matching_callbacks(app, tg_update(app, "/horas", chat_type="supergroup")) == []
+
+
+def test_stickers_are_routed_to_the_emoji_flow(app):
+    from telegram import Sticker
+
+    sticker = Sticker(file_id="s", file_unique_id="u", width=512, height=512, is_animated=False, is_video=False,
+                      type="regular", emoji="👍")
+    message = Message(message_id=2, date=datetime.now(), chat=Chat(id=1, type="private"), sticker=sticker,
+                      from_user=User(id=1, first_name="Aluno", is_bot=False))
+    assert matching_callbacks(app, Update(update_id=2, message=message))[0] == "handle_sticker"
 
 
 def test_unknown_command_gets_a_reply(app):

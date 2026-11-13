@@ -3,6 +3,8 @@ import logging
 import html
 import os
 import re
+import time
+import unicodedata
 import asyncio
 import chromadb
 from dotenv import load_dotenv
@@ -79,6 +81,13 @@ MAX_LISTED_ACTIVITIES = 30
 # Certificates are analysed one at a time for everyone, so one student can't queue an unbounded batch.
 MAX_CERTIFICATES_IN_FLIGHT = 5
 _certificates_in_flight: dict[int, int] = {}
+RESET_CONFIRM_SECONDS = 600
+REACTION_INSTRUCTION = (
+    "(A mensagem do aluno tem só emoji. Trate como uma reação à sua última resposta: por exemplo 👍 ou 👌 = "
+    "entendido/ok, ❤️ ou 🙏 = agradecimento, 😡 ou 👎 = insatisfação, 😂 = achou graça, 😢 = tristeza, "
+    "🤔 ou ❓ = dúvida. Responda em no máximo duas frases curtas, sem repetir a resposta anterior e sem linha "
+    "de fonte. Se for insatisfação ou dúvida, pergunte o que pode melhorar ou explicar de outro jeito.)"
+)
 SOURCE_LINE = re.compile(r"^\W*fontes?\W*:(.*)$", re.IGNORECASE)
 # gpt-oss marks citations inline like 【Fonte: ...】 even when told not to.
 INLINE_CITATION = re.compile(r"\s*【[^】]*】")
@@ -115,7 +124,7 @@ COMMANDS_TEXT = (
     "/coordep - Contato da coordenação de Engenharia de Produção\n"
     "/coordem - Contato da coordenação de Engenharia Mecânica\n"
     "/coordec - Contato da coordenação de Engenharia Civil\n"
-    "/reset - Reinicia a memória da nossa conversa"
+    "/reset - Apaga tudo que o bot guarda sobre você (curso, horas e conversa)"
 )
 
 #Functions
@@ -163,12 +172,27 @@ async def send_formatted(update: Update, text: str) -> None:
             await update.message.reply_text(re.sub(r"\*\*|`|^#{1,6}\s*", "", part, flags=re.M))
 
 
+def _telegram_len(text: str) -> int:
+    # Telegram limits messages in UTF-16 code units, where most emojis count as 2.
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _fit_index(text: str, limit: int) -> int:
+    units = 0
+    for index, char in enumerate(text):
+        units += 2 if ord(char) > 0xFFFF else 1
+        if units > limit:
+            return index
+    return len(text)
+
+
 def split_message(text: str, limit: int = TELEGRAM_MAX_LEN) -> list[str]:
     parts = []
-    while len(text) > limit:
-        cut = text.rfind("\n", 0, limit)
+    while _telegram_len(text) > limit:
+        fit = _fit_index(text, limit)
+        cut = text.rfind("\n", 0, fit)
         if cut <= 0:
-            cut = limit
+            cut = fit
         parts.append(text[:cut])
         text = text[cut:].lstrip("\n")
     if text:
@@ -256,6 +280,22 @@ async def generate_reply(chat_id: int, user_text: str, course: str | None) -> tu
     return reply_text, provider
 
 
+def is_emoji_only(text: str) -> bool:
+    """True for messages like "👍" or "❤️😂": no letters or digits, so there's nothing to search for."""
+    return bool(text.strip()) and not any(unicodedata.category(ch)[0] in "LN" for ch in text)
+
+
+async def generate_reaction(chat_id: int, user_text: str, course: str | None) -> tuple[str | None, str | None]:
+    # Searching the documents for an emoji returns the same chunks as the previous question, and the
+    # model would just repeat its last answer.
+    messages = build_messages(chat_id, user_text, [], course)
+    messages[-1]["content"] = f"Mensagem do aluno: {user_text}\n\n{REACTION_INSTRUCTION}"
+    reply_text, provider = await llm.answer(messages)
+    if reply_text:
+        reply_text = clean_source_line(reply_text, [])
+    return reply_text, provider
+
+
 def clean_source_line(reply: str, titles: list[str]) -> str:
     """Drops a trailing "Fonte:" line unless it names a document that was actually in the context
     (the model sometimes leaves it empty, writes "nenhum" or makes one up)."""
@@ -299,6 +339,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await process_text(update, context, update.message.text)
 
 
+async def handle_sticker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Stickers and animated emojis (dice) are answered as the emoji they represent."""
+    message = update.message
+    emoji = (message.sticker.emoji if message.sticker else None) or (message.dice.emoji if message.dice else None)
+    await process_text(update, context, emoji or "🙂")
+
+
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     audio = update.message.voice or update.message.audio
     if audio.duration and audio.duration > MAX_VOICE_SECONDS:
@@ -332,11 +379,14 @@ async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, user_
     reply_text, provider, course, activities = None, None, None, None
     try:
         async with asyncio.timeout(MESSAGE_TIMEOUT):
-            course = await resolve_course(chat_id, user_text)
-            if horas.supports(course) and horas.declares_activity(user_text):
-                activities = await horas.extract(user_text, course)
-            if not activities:
-                reply_text, provider = await generate_reply(chat_id, user_text, course)
+            if is_emoji_only(user_text):
+                reply_text, provider = await generate_reaction(chat_id, user_text, db.get_course(chat_id))
+            else:
+                course = await resolve_course(chat_id, user_text)
+                if horas.supports(course) and horas.declares_activity(user_text):
+                    activities = await horas.extract(user_text, course)
+                if not activities:
+                    reply_text, provider = await generate_reply(chat_id, user_text, course)
     except TimeoutError:
         logger.error("Tempo esgotado gerando resposta para %s", chat_id)
     except Exception:
@@ -596,9 +646,40 @@ async def handle_unsupported(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "Desculpe, só consigo entender mensagens de texto, áudios e certificados em PDF ou foto."
     )
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    stamp = int(time.time())
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("Apagar tudo", callback_data=f"rst:ok:{stamp}"),
+        InlineKeyboardButton("Cancelar", callback_data=f"rst:no:{stamp}"),
+    ]])
+    await update.message.reply_text(
+        "Isso apaga tudo que eu guardo sobre você: o curso registrado, as horas complementares registradas "
+        "e o histórico da nossa conversa. Não dá para desfazer. Quer mesmo apagar?\n\n"
+        "(As mensagens que aparecem aqui no Telegram continuam; para sumir com elas, apague a conversa no app.)",
+        reply_markup=keyboard,
+    )
+
+
+async def handle_reset_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    try:
+        await query.answer()
+    except BadRequest:
+        pass
+    _, action, stamp = query.data.split(":", 2)
     chat_id = update.effective_chat.id
-    db.clear_history(chat_id)
-    await update.message.reply_text("Memória da conversa reiniciada.")
+    if action != "ok":
+        await _edit(query, "Cancelado, não apaguei nada.")
+        return
+    # An old "Apagar tudo" button left in the chat shouldn't wipe everything by accident.
+    if not stamp.isdigit() or time.time() - int(stamp) > RESET_CONFIRM_SECONDS:
+        await _edit(query, "Esse pedido expirou. Se ainda quiser apagar seus dados, use /reset de novo.")
+        return
+    db.delete_user_data(chat_id)
+    horas.clear_pending(chat_id)
+    awaiting_feedback.discard(chat_id)
+    logger.info("Dados de um aluno apagados a pedido dele")
+    await _edit(query, "Pronto, apaguei tudo que eu guardava sobre você: curso, horas registradas e histórico "
+                       "da conversa. Se quiser recomeçar, é só me mandar uma mensagem.")
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "*Assistente Virtual - UFC Russas*\n\n"
@@ -644,6 +725,9 @@ async def faq(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "*Onde encontro apoio psicológico?*\n"
         "A Assistência Estudantil do Campus de Russas atende por agendamento: (88) 3411-9235 "
         "ou pelo Instagram @ae.ufcrussas.\n\n"
+        "*Como apago meus dados?*\n"
+        "Use /reset: ele apaga seu curso, suas horas registradas e o histórico da conversa. "
+        "O feedback é anônimo e não fica ligado a você.\n\n"
         "*Como consigo bolsas e auxílios?*\n"
         "Os auxílios da PRAE exigem o Cadastro Socioeconômico; os editais (como a Bolsa de Iniciação Acadêmica) "
         "saem no site da PRAE. Bolsas como PET e monitoria são divulgadas pela coordenação do curso.\n\n"
@@ -772,7 +856,9 @@ def build_application() -> Application:
     application.add_handler(MessageHandler(
         new_private & (filters.PHOTO | filters.Document.PDF | filters.Document.IMAGE), handle_certificate))
     application.add_handler(CallbackQueryHandler(handle_hours_callback, pattern=r"^hrs:"))
+    application.add_handler(CallbackQueryHandler(handle_reset_callback, pattern=r"^rst:"))
     application.add_handler(MessageHandler(new_private & (filters.VOICE | filters.AUDIO), handle_voice))
+    application.add_handler(MessageHandler(new_private & (filters.Sticker.ALL | filters.Dice.ALL), handle_sticker))
     application.add_handler(MessageHandler(new_private & ~filters.TEXT, handle_unsupported))
     application.add_error_handler(on_error)
     return application

@@ -145,7 +145,7 @@ class FakeAttachment:
 
 class FakeIncoming:
     def __init__(self, recorder: Recorder, text=None, caption=None, photo=None, document=None,
-                 voice=None, audio=None):
+                 voice=None, audio=None, sticker=None, dice=None):
         self.recorder = recorder
         self.text = text
         self.caption = caption
@@ -153,6 +153,8 @@ class FakeIncoming:
         self.document = document
         self.voice = voice
         self.audio = audio
+        self.sticker = sticker
+        self.dice = dice
 
     async def reply_text(self, text, reply_markup=None, parse_mode=None, **kwargs):
         return await _send(self.recorder, text, reply_markup, parse_mode)
